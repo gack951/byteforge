@@ -13,9 +13,10 @@ use core::{
 };
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId,
-    FocusHandle, Focusable, KeyBinding, KeyDownEvent, Menu, MenuItem, SharedString, SystemMenuType,
-    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, rgba, size,
-    uniform_list,
+    FocusHandle, Focusable, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ScrollStrategy, SharedString, SystemMenuType,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
+    rgb, rgba, size, uniform_list,
 };
 
 const BYTES_PER_ROW_OPTIONS: [usize; 4] = [8, 16, 24, 32];
@@ -36,6 +37,11 @@ actions!(
         SelectAll,
         FindNext,
         CompareNext,
+        Goto,
+        ToggleSplit,
+        MoveToOtherSplit,
+        FocusLeftPane,
+        FocusRightPane,
         ToggleEndian,
         NextEncoding,
         NextRowWidth,
@@ -65,10 +71,28 @@ impl EditMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneSide {
+    Left,
+    Right,
+}
+
+impl PaneSide {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+        }
+    }
+}
+
 struct ByteForge {
     docs: Vec<ByteDocument>,
     active: usize,
     compare_with: Option<usize>,
+    split: bool,
+    focused_pane: PaneSide,
+    right_active: Option<usize>,
     cursor: u64,
     selection: Option<Selection>,
     bytes_per_row_ix: usize,
@@ -76,6 +100,11 @@ struct ByteForge {
     encoding: PreviewEncoding,
     edit_mode: EditMode,
     pending_hex: Option<u8>,
+    drag_anchor: Option<u64>,
+    goto_open: bool,
+    goto_input: String,
+    left_scroll_handle: UniformListScrollHandle,
+    right_scroll_handle: UniformListScrollHandle,
     status: SharedString,
     focus_handle: FocusHandle,
 }
@@ -94,6 +123,9 @@ impl ByteForge {
             docs,
             active: 0,
             compare_with: None,
+            split: false,
+            focused_pane: PaneSide::Left,
+            right_active: None,
             cursor: 0,
             selection: None,
             bytes_per_row_ix: 1,
@@ -101,6 +133,11 @@ impl ByteForge {
             encoding: PreviewEncoding::Utf8,
             edit_mode: EditMode::Overwrite,
             pending_hex: None,
+            drag_anchor: None,
+            goto_open: false,
+            goto_input: String::new(),
+            left_scroll_handle: UniformListScrollHandle::new(),
+            right_scroll_handle: UniformListScrollHandle::new(),
             status: "Open one or more files to begin.".into(),
             focus_handle: cx.focus_handle(),
         }
@@ -112,6 +149,9 @@ impl ByteForge {
             docs,
             active: 0,
             compare_with: None,
+            split: false,
+            focused_pane: PaneSide::Left,
+            right_active: None,
             cursor: 0,
             selection: None,
             bytes_per_row_ix: 1,
@@ -119,6 +159,11 @@ impl ByteForge {
             encoding: PreviewEncoding::Utf8,
             edit_mode: EditMode::Overwrite,
             pending_hex: None,
+            drag_anchor: None,
+            goto_open: false,
+            goto_input: String::new(),
+            left_scroll_handle: UniformListScrollHandle::new(),
+            right_scroll_handle: UniformListScrollHandle::new(),
             status: "Ready.".into(),
             focus_handle: cx.focus_handle(),
         }
@@ -129,16 +174,68 @@ impl ByteForge {
     }
 
     fn active_doc(&self) -> Option<&ByteDocument> {
-        self.docs.get(self.active)
+        self.docs.get(self.focused_active_ix())
     }
 
     fn active_doc_mut(&mut self) -> Option<&mut ByteDocument> {
-        self.docs.get_mut(self.active)
+        let ix = self.focused_active_ix();
+        self.docs.get_mut(ix)
+    }
+
+    fn focused_active_ix(&self) -> usize {
+        if self.split && self.focused_pane == PaneSide::Right {
+            self.right_active.unwrap_or(self.active)
+        } else {
+            self.active
+        }
+    }
+
+    fn active_ix_for(&self, side: PaneSide) -> Option<usize> {
+        match side {
+            PaneSide::Left => (!self.docs.is_empty()).then_some(self.active),
+            PaneSide::Right => {
+                if self.split {
+                    self.right_active
+                        .or((!self.docs.is_empty()).then_some(self.active))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn focus_pane(&mut self, side: PaneSide) {
+        if side == PaneSide::Right && !self.split {
+            return;
+        }
+        self.focused_pane = side;
+        self.pending_hex = None;
+    }
+
+    fn set_active_for_focused_pane(&mut self, ix: usize) {
+        if self.split && self.focused_pane == PaneSide::Right {
+            self.right_active = Some(ix);
+        } else {
+            self.active = ix;
+        }
+    }
+
+    fn scroll_handle_for(&self, side: PaneSide) -> UniformListScrollHandle {
+        match side {
+            PaneSide::Left => self.left_scroll_handle.clone(),
+            PaneSide::Right => self.right_scroll_handle.clone(),
+        }
+    }
+
+    fn scroll_to_cursor(&self) {
+        let row = (self.cursor / self.bytes_per_row() as u64).min(usize::MAX as u64) as usize;
+        self.scroll_handle_for(self.focused_pane)
+            .scroll_to_item(row, ScrollStrategy::Center);
     }
 
     fn clamp_cursor(&mut self) {
         let len = self.active_doc().map(ByteDocument::len).unwrap_or(0);
-        self.cursor = self.cursor.min(len.saturating_sub(1));
+        self.cursor = self.cursor.min(len);
     }
 
     fn set_status(&mut self, text: impl Into<SharedString>) {
@@ -147,14 +244,7 @@ impl ByteForge {
 
     fn set_cursor(&mut self, offset: u64, extend: bool, cx: &mut Context<Self>) {
         let len = self.active_doc().map(ByteDocument::len).unwrap_or(0);
-        if len == 0 {
-            self.cursor = 0;
-            self.selection = None;
-            cx.notify();
-            return;
-        }
-
-        let offset = offset.min(len - 1);
+        let offset = offset.min(len);
         if extend {
             let anchor = self
                 .selection
@@ -167,18 +257,63 @@ impl ByteForge {
         }
         self.cursor = offset;
         self.pending_hex = None;
+        self.scroll_to_cursor();
+        cx.notify();
+    }
+
+    fn begin_cell_selection(
+        &mut self,
+        doc_ix: usize,
+        side: PaneSide,
+        offset: u64,
+        extend: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_pane(side);
+        self.set_active_for_focused_pane(doc_ix);
+        self.drag_anchor = Some(offset);
+        self.set_cursor(offset, extend, cx);
+    }
+
+    fn drag_cell_selection(
+        &mut self,
+        doc_ix: usize,
+        side: PaneSide,
+        offset: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_anchor.is_none() {
+            return;
+        }
+        self.focus_pane(side);
+        self.set_active_for_focused_pane(doc_ix);
+        self.set_cursor(offset, true, cx);
+    }
+
+    fn finish_cell_selection(&mut self, cx: &mut Context<Self>) {
+        self.drag_anchor = None;
         cx.notify();
     }
 
     fn selection_range(&self) -> Option<Range<u64>> {
-        self.selection.as_ref().map(Selection::normalized)
+        let len = self.active_doc().map(ByteDocument::len).unwrap_or(0);
+        self.selection.as_ref().and_then(|selection| {
+            let mut range = selection.normalized();
+            range.start = range.start.min(len);
+            range.end = range.end.min(len);
+            (range.start < range.end).then_some(range)
+        })
     }
 
     fn selected_or_cursor_range(&self) -> Option<Range<u64>> {
         if let Some(range) = self.selection_range() {
             Some(range)
-        } else if self.active_doc().is_some_and(|doc| !doc.is_empty()) {
-            Some(self.cursor..self.cursor + 1)
+        } else if let Some(doc) = self.active_doc() {
+            if self.cursor < doc.len() {
+                Some(self.cursor..self.cursor + 1)
+            } else {
+                Some(doc.len()..doc.len())
+            }
         } else {
             None
         }
@@ -207,7 +342,8 @@ impl ByteForge {
         }
 
         if opened > 0 {
-            self.active = self.docs.len() - opened;
+            let first_opened = self.docs.len() - opened;
+            self.set_active_for_focused_pane(first_opened);
             self.cursor = 0;
             self.selection = None;
             self.compare_with = None;
@@ -337,11 +473,16 @@ impl ByteForge {
     }
 
     fn delete_selection(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(range) = self.selection_range() else {
-            self.set_status("No selection to delete.");
+        let Some(range) = self.selected_or_cursor_range() else {
+            self.set_status("No byte to delete.");
             cx.notify();
             return;
         };
+        if range.is_empty() {
+            self.set_status("No byte at cursor.");
+            cx.notify();
+            return;
+        }
         match self.active_doc_mut().map(|doc| doc.delete(range.clone())) {
             Some(Ok(())) => {
                 self.cursor = range.start;
@@ -383,6 +524,7 @@ impl ByteForge {
             Some(offset) => {
                 self.cursor = offset;
                 self.selection = Some(Selection::new(offset, offset + needle.len() as u64 - 1));
+                self.scroll_to_cursor();
                 self.set_status(format!("Found {} byte(s) at 0x{offset:X}.", needle.len()));
             }
             None => self.set_status("Pattern not found."),
@@ -402,7 +544,8 @@ impl ByteForge {
             Some(ix) => (ix + 1) % self.docs.len(),
             None => (self.active + 1) % self.docs.len(),
         };
-        self.compare_with = Some(if next == self.active {
+        let active = self.focused_active_ix();
+        self.compare_with = Some(if next == active {
             (next + 1) % self.docs.len()
         } else {
             next
@@ -439,6 +582,75 @@ impl ByteForge {
         cx.notify();
     }
 
+    fn goto(&mut self, _: &Goto, _: &mut Window, cx: &mut Context<Self>) {
+        self.goto_open = true;
+        self.goto_input = format!("0x{:X}", self.cursor);
+        self.pending_hex = None;
+        self.set_status("Goto: type an offset, Enter to jump, Esc to cancel.");
+        cx.notify();
+    }
+
+    fn toggle_split(&mut self, _: &ToggleSplit, _: &mut Window, cx: &mut Context<Self>) {
+        self.split = !self.split;
+        if self.split {
+            self.right_active = self.right_active.or_else(|| {
+                if self.docs.len() > 1 {
+                    Some((self.active + 1) % self.docs.len())
+                } else {
+                    (!self.docs.is_empty()).then_some(self.active)
+                }
+            });
+            self.set_status("Split view enabled.");
+        } else {
+            self.focused_pane = PaneSide::Left;
+            self.set_status("Split view disabled.");
+        }
+        cx.notify();
+    }
+
+    fn move_to_other_split(
+        &mut self,
+        _: &MoveToOtherSplit,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.docs.is_empty() {
+            return;
+        }
+        if !self.split {
+            self.split = true;
+        }
+        match self.focused_pane {
+            PaneSide::Left => {
+                self.right_active = Some(self.active);
+                self.focused_pane = PaneSide::Right;
+            }
+            PaneSide::Right => {
+                if let Some(ix) = self.right_active {
+                    self.active = ix;
+                }
+                self.focused_pane = PaneSide::Left;
+            }
+        }
+        self.set_status(format!(
+            "Moved active file to {} pane.",
+            self.focused_pane.label()
+        ));
+        cx.notify();
+    }
+
+    fn focus_left_pane(&mut self, _: &FocusLeftPane, _: &mut Window, cx: &mut Context<Self>) {
+        self.focus_pane(PaneSide::Left);
+        cx.notify();
+    }
+
+    fn focus_right_pane(&mut self, _: &FocusRightPane, _: &mut Window, cx: &mut Context<Self>) {
+        if self.split {
+            self.focus_pane(PaneSide::Right);
+            cx.notify();
+        }
+    }
+
     fn move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.move_cursor(-1, false, cx);
     }
@@ -468,17 +680,23 @@ impl ByteForge {
             return;
         };
         if doc.is_empty() {
+            self.set_cursor(0, extend, cx);
             return;
         }
         let next = if delta.is_negative() {
             self.cursor.saturating_sub(delta.unsigned_abs())
         } else {
-            self.cursor.saturating_add(delta as u64).min(doc.len() - 1)
+            self.cursor.saturating_add(delta as u64).min(doc.len())
         };
         self.set_cursor(next, extend, cx);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.goto_open {
+            self.handle_goto_key(event, cx);
+            return;
+        }
+
         if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
             return;
         }
@@ -493,6 +711,54 @@ impl ByteForge {
             self.input_hex_nibble(nibble as u8, cx);
             cx.stop_propagation();
         }
+    }
+
+    fn handle_goto_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                self.confirm_goto(cx);
+                cx.stop_propagation();
+            }
+            "escape" => {
+                self.goto_open = false;
+                self.set_status("Goto cancelled.");
+                cx.notify();
+                cx.stop_propagation();
+            }
+            "backspace" => {
+                self.goto_input.pop();
+                cx.notify();
+                cx.stop_propagation();
+            }
+            _ => {
+                let Some(key_char) = event.keystroke.key_char.as_deref() else {
+                    return;
+                };
+                for ch in key_char.chars() {
+                    if ch.is_ascii_hexdigit() || ch == 'x' || ch == 'X' {
+                        self.goto_input.push(ch);
+                    }
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+        }
+    }
+
+    fn confirm_goto(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = parse_offset(&self.goto_input) else {
+            self.set_status("Goto failed: enter decimal or 0x-prefixed hex.");
+            cx.notify();
+            return;
+        };
+        let len = self.active_doc().map(ByteDocument::len).unwrap_or(0);
+        self.cursor = target.min(len);
+        self.selection = None;
+        self.goto_open = false;
+        self.pending_hex = None;
+        self.scroll_to_cursor();
+        self.set_status(format!("Moved to 0x{:X}.", self.cursor));
+        cx.notify();
     }
 
     fn input_hex_nibble(&mut self, nibble: u8, cx: &mut Context<Self>) {
@@ -543,7 +809,7 @@ impl ByteForge {
 
     fn activate_doc(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.docs.len() {
-            self.active = ix;
+            self.set_active_for_focused_pane(ix);
             self.cursor = 0;
             self.selection = None;
             self.pending_hex = None;
@@ -567,84 +833,90 @@ impl ByteForge {
             .child(self.toolbar_button(
                 "open",
                 "Open",
+                Some("Ctrl+O"),
                 cx.listener(|this, _, window, cx| this.open_files(&OpenFiles, window, cx)),
             ))
             .child(self.toolbar_button(
                 "save-as",
                 "Save As",
+                Some("Ctrl+S"),
                 cx.listener(|this, _, window, cx| this.save_as(&SaveAs, window, cx)),
             ))
             .child(self.toolbar_button(
                 "copy-hex",
                 "Copy Hex",
+                Some("Ctrl+C"),
                 cx.listener(|this, _, window, cx| this.copy_hex(&CopyHex, window, cx)),
             ))
             .child(self.toolbar_button(
                 "copy-text",
                 "Copy Text",
+                Some("Ctrl+Shift+C"),
                 cx.listener(|this, _, window, cx| this.copy_text(&CopyText, window, cx)),
             ))
             .child(self.toolbar_button(
                 "undo",
                 "Undo",
+                Some("Ctrl+Z"),
                 cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx)),
             ))
             .child(self.toolbar_button(
                 "redo",
                 "Redo",
+                Some("Ctrl+Y"),
                 cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx)),
             ))
             .child(self.toolbar_button(
                 "paste-hex",
                 "Paste Hex",
+                Some("Ctrl+V"),
                 cx.listener(|this, _, window, cx| this.paste_hex(&PasteHex, window, cx)),
             ))
             .child(self.toolbar_button(
                 "paste-text",
                 "Paste Text",
+                Some("Ctrl+Shift+V"),
                 cx.listener(|this, _, window, cx| this.paste_text(&PasteText, window, cx)),
             ))
             .child(self.toolbar_button(
                 "delete",
                 "Delete",
+                Some("Del"),
                 cx.listener(|this, _, window, cx| {
                     this.delete_selection(&DeleteSelection, window, cx)
                 }),
             ))
             .child(self.toolbar_button(
                 "find-clip",
-                "Find Clip",
+                "Find",
+                Some("Ctrl+F"),
                 cx.listener(|this, _, window, cx| this.find_next(&FindNext, window, cx)),
+            ))
+            .child(self.toolbar_button(
+                "goto",
+                "Goto",
+                Some("Ctrl+G"),
+                cx.listener(|this, _, window, cx| this.goto(&Goto, window, cx)),
             ))
             .child(self.toolbar_button(
                 "compare",
                 "Compare",
+                Some("Ctrl+D"),
                 cx.listener(|this, _, window, cx| this.compare_next(&CompareNext, window, cx)),
             ))
             .child(self.toolbar_button(
-                "row-width",
-                format!("{} B/row", self.bytes_per_row()),
-                cx.listener(|this, _, window, cx| this.next_row_width(&NextRowWidth, window, cx)),
+                "split",
+                "Split",
+                Some("Ctrl+\\"),
+                cx.listener(|this, _, window, cx| this.toggle_split(&ToggleSplit, window, cx)),
             ))
             .child(self.toolbar_button(
-                "edit-mode",
-                self.edit_mode.label(),
+                "move-pane",
+                "Move Pane",
+                Some("Ctrl+M"),
                 cx.listener(|this, _, window, cx| {
-                    this.toggle_insert_mode(&ToggleInsertMode, window, cx)
+                    this.move_to_other_split(&MoveToOtherSplit, window, cx)
                 }),
-            ))
-            .child(self.toolbar_button(
-                "endian",
-                match self.endian {
-                    Endianness::Little => "Little",
-                    Endianness::Big => "Big",
-                },
-                cx.listener(|this, _, window, cx| this.toggle_endian(&ToggleEndian, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "encoding",
-                self.encoding.label(),
-                cx.listener(|this, _, window, cx| this.next_encoding(&NextEncoding, window, cx)),
             ))
     }
 
@@ -652,10 +924,15 @@ impl ByteForge {
         &self,
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
+        shortcut: Option<&'static str>,
         listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
+        let shortcut = shortcut.map(SharedString::from);
         div()
             .id(id)
+            .flex()
+            .items_center()
+            .gap_1()
             .px_2()
             .py_1()
             .rounded_sm()
@@ -664,7 +941,19 @@ impl ByteForge {
             .text_sm()
             .cursor_pointer()
             .hover(|style| style.bg(rgb(0x3e4855)))
-            .child(label.into())
+            .child(div().child(label.into()))
+            .children(shortcut.into_iter().map(|shortcut| {
+                div()
+                    .h(px(17.0))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .bg(rgb(0x46505e))
+                    .text_color(rgb(0xe6edf7))
+                    .text_xs()
+                    .child(shortcut)
+            }))
             .on_click(listener)
             .into_any_element()
     }
@@ -711,42 +1000,109 @@ impl ByteForge {
     }
 
     fn render_hex_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(doc) = self.active_doc() else {
+        if self.split {
+            div()
+                .flex()
+                .flex_1()
+                .child(self.render_hex_pane(PaneSide::Left, cx))
+                .child(div().w(px(1.0)).h_full().bg(rgb(0x303741)))
+                .child(self.render_hex_pane(PaneSide::Right, cx))
+        } else {
+            div()
+                .flex()
+                .flex_1()
+                .child(self.render_hex_pane(PaneSide::Left, cx))
+        }
+    }
+
+    fn render_hex_pane(&mut self, side: PaneSide, cx: &mut Context<Self>) -> AnyElement {
+        let Some(doc_ix) = self.active_ix_for(side) else {
             return div()
                 .flex_1()
                 .items_center()
                 .justify_center()
                 .bg(rgb(0x101318))
                 .text_color(rgb(0x8792a2))
-                .child("Open files with the toolbar, menu, or Ctrl+O.");
+                .child("Open files with the toolbar, menu, or Ctrl+O.")
+                .into_any_element();
+        };
+        let Some(doc) = self.docs.get(doc_ix) else {
+            return div().flex_1().into_any_element();
         };
 
         let bytes_per_row = self.bytes_per_row();
-        let row_count = doc
-            .len()
-            .div_ceil(bytes_per_row as u64)
-            .min(usize::MAX as u64) as usize;
-        div().flex_1().bg(rgb(0x101318)).child(
-            uniform_list(
-                "hex-rows",
-                row_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    let mut rows = Vec::with_capacity(range.end - range.start);
-                    for row in range {
-                        rows.push(this.render_hex_row(row, cx));
-                    }
-                    rows
-                }),
+        let row_count = (doc.len() / bytes_per_row as u64 + 1).min(usize::MAX as u64) as usize;
+        let focus_color = if self.focused_pane == side {
+            rgb(0x3f7ab7)
+        } else {
+            rgb(0x303741)
+        };
+        div()
+            .id(("hex-pane", pane_index(side)))
+            .flex_1()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x101318))
+            .border_1()
+            .border_color(focus_color)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.focus_pane(side);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(0x15181d))
+                    .text_xs()
+                    .text_color(rgb(0xb8c1cf))
+                    .child(format!(
+                        "{} pane: {}{}",
+                        side.label(),
+                        doc.name(),
+                        if doc.is_dirty() { "*" } else { "" }
+                    ))
+                    .child(if self.focused_pane == side {
+                        "focused"
+                    } else {
+                        ""
+                    }),
             )
-            .h_full(),
-        )
+            .child(
+                div().flex_1().child(
+                    uniform_list(
+                        ("hex-rows", pane_index(side)),
+                        row_count,
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            let mut rows = Vec::with_capacity(range.end - range.start);
+                            for row in range {
+                                rows.push(this.render_hex_row(doc_ix, side, row, cx));
+                            }
+                            rows
+                        }),
+                    )
+                    .track_scroll(self.scroll_handle_for(side))
+                    .h_full(),
+                ),
+            )
+            .into_any_element()
     }
 
-    fn render_hex_row(&self, row: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_hex_row(
+        &self,
+        doc_ix: usize,
+        side: PaneSide,
+        row: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let bytes_per_row = self.bytes_per_row();
         let offset = row as u64 * bytes_per_row as u64;
         let bytes = self
-            .active_doc()
+            .docs
+            .get(doc_ix)
             .map(|doc| doc.read_range(offset, bytes_per_row))
             .unwrap_or_default();
 
@@ -756,8 +1112,13 @@ impl ByteForge {
             let label = bytes
                 .get(ix)
                 .map(|byte| format!("{byte:02X}"))
+                .or_else(|| {
+                    self.docs
+                        .get(doc_ix)
+                        .and_then(|doc| (byte_offset == doc.len()).then_some("++".to_string()))
+                })
                 .unwrap_or_else(|| "  ".to_string());
-            byte_cells.push(self.render_byte_cell(byte_offset, label, cx));
+            byte_cells.push(self.render_byte_cell(doc_ix, side, byte_offset, label, cx));
         }
 
         let mut ascii_cells = Vec::with_capacity(bytes_per_row);
@@ -772,8 +1133,13 @@ impl ByteForge {
                         '.'
                     }
                 })
+                .or_else(|| {
+                    self.docs
+                        .get(doc_ix)
+                        .and_then(|doc| (byte_offset == doc.len()).then_some('+'))
+                })
                 .unwrap_or(' ');
-            ascii_cells.push(self.render_ascii_cell(byte_offset, ch, cx));
+            ascii_cells.push(self.render_ascii_cell(doc_ix, side, byte_offset, ch, cx));
         }
 
         div()
@@ -795,57 +1161,136 @@ impl ByteForge {
             .into_any_element()
     }
 
-    fn render_byte_cell(&self, offset: u64, label: String, cx: &mut Context<Self>) -> AnyElement {
-        let exists = self.active_doc().is_some_and(|doc| offset < doc.len());
+    fn render_byte_cell(
+        &self,
+        doc_ix: usize,
+        side: PaneSide,
+        offset: u64,
+        label: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let doc_len = self.docs.get(doc_ix).map(ByteDocument::len).unwrap_or(0);
+        let exists = offset < doc_len;
+        let insertion_point = offset == doc_len;
+        let clickable = offset <= doc_len;
         let selected = self
             .selection_range()
             .is_some_and(|range| range.start <= offset && offset < range.end);
-        let cursor = offset == self.cursor && exists;
-        let different = self.is_different(offset);
+        let cursor = offset == self.cursor && self.focused_pane == side && clickable;
+        let different = self.is_different_for(doc_ix, offset);
 
         let mut cell = div()
-            .id(byte_cell_id(offset, 0))
+            .id(("byte", byte_cell_id(side, offset, 0)))
             .w(px(28.0))
             .h(px(22.0))
             .flex()
             .items_center()
             .justify_center()
             .rounded_sm()
+            .border_1()
+            .border_color(rgba(0x00000000))
             .cursor_pointer()
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| this.set_cursor(offset, false, cx)));
+            .child(label);
+
+        if clickable {
+            cell = cell
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.begin_cell_selection(doc_ix, side, offset, event.modifiers.shift, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if this.drag_anchor.is_some() && event.dragging() {
+                        this.drag_cell_selection(doc_ix, side, offset, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                        this.finish_cell_selection(cx);
+                        cx.stop_propagation();
+                    }),
+                );
+        }
 
         cell = if selected {
             cell.bg(rgb(0x2e6fb8)).text_color(rgb(0xffffff))
+        } else if cursor && self.edit_mode == EditMode::Insert {
+            cell.bg(rgb(0x171c22))
+                .border_color(rgb(0xd7a94a))
+                .text_color(rgb(0xf3d68b))
         } else if cursor {
             cell.bg(rgb(0xd7a94a)).text_color(rgb(0x101318))
         } else if different {
             cell.bg(rgba(0xff5c5c40))
         } else if exists {
             cell.bg(rgb(0x171c22))
+        } else if insertion_point {
+            cell.bg(rgb(0x121920)).text_color(rgb(0x7ea4d8))
         } else {
             cell.text_color(rgb(0x3c4654))
         };
         cell.into_any_element()
     }
 
-    fn render_ascii_cell(&self, offset: u64, ch: char, cx: &mut Context<Self>) -> AnyElement {
-        let exists = self.active_doc().is_some_and(|doc| offset < doc.len());
+    fn render_ascii_cell(
+        &self,
+        doc_ix: usize,
+        side: PaneSide,
+        offset: u64,
+        ch: char,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let doc_len = self.docs.get(doc_ix).map(ByteDocument::len).unwrap_or(0);
+        let exists = offset < doc_len;
+        let clickable = offset <= doc_len;
+        let cursor = offset == self.cursor && self.focused_pane == side && clickable;
         let selected = self
             .selection_range()
             .is_some_and(|range| range.start <= offset && offset < range.end);
         let mut cell = div()
-            .id(byte_cell_id(offset, 1))
+            .id(("byte", byte_cell_id(side, offset, 1)))
             .w(px(14.0))
             .h(px(22.0))
             .flex()
             .items_center()
             .justify_center()
+            .border_1()
+            .border_color(rgba(0x00000000))
             .cursor_pointer()
-            .child(ch.to_string())
-            .on_click(cx.listener(move |this, _, _, cx| this.set_cursor(offset, false, cx)));
+            .child(ch.to_string());
+        if clickable {
+            cell = cell
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.begin_cell_selection(doc_ix, side, offset, event.modifiers.shift, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                    if this.drag_anchor.is_some() && event.dragging() {
+                        this.drag_cell_selection(doc_ix, side, offset, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                        this.finish_cell_selection(cx);
+                        cx.stop_propagation();
+                    }),
+                );
+        }
         cell = if selected {
             cell.bg(rgb(0x2e6fb8)).text_color(rgb(0xffffff))
+        } else if cursor && self.edit_mode == EditMode::Insert {
+            cell.border_color(rgb(0xd7a94a)).text_color(rgb(0xf3d68b))
+        } else if cursor {
+            cell.bg(rgb(0xd7a94a)).text_color(rgb(0x101318))
         } else if exists {
             cell.text_color(rgb(0xb8c1cf))
         } else {
@@ -854,11 +1299,16 @@ impl ByteForge {
         cell.into_any_element()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn is_different(&self, offset: u64) -> bool {
+        self.is_different_for(self.focused_active_ix(), offset)
+    }
+
+    fn is_different_for(&self, doc_ix: usize, offset: u64) -> bool {
         let Some(compare_ix) = self.compare_with else {
             return false;
         };
-        let Some(left) = self.active_doc().and_then(|doc| doc.byte_at(offset)) else {
+        let Some(left) = self.docs.get(doc_ix).and_then(|doc| doc.byte_at(offset)) else {
             return false;
         };
         self.docs
@@ -952,8 +1402,21 @@ impl ByteForge {
             .child(div().text_align(gpui::TextAlign::Right).child(value.into()))
     }
 
-    fn render_status(&self) -> impl IntoElement {
+    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let message = if self.goto_open {
+            format!("Goto > {}", self.goto_input)
+        } else {
+            self.status.to_string()
+        };
+        let endian_label = match self.endian {
+            Endianness::Little => "Little",
+            Endianness::Big => "Big",
+        };
         div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
             .px_2()
             .py_1()
             .bg(rgb(0x20242a))
@@ -961,7 +1424,61 @@ impl ByteForge {
             .border_color(rgb(0x303741))
             .text_color(rgb(0xb8c1cf))
             .text_sm()
-            .child(self.status.clone())
+            .child(div().child(message))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.toolbar_button(
+                        "focus-left",
+                        "Left",
+                        Some("Ctrl+1"),
+                        cx.listener(|this, _, window, cx| {
+                            this.focus_left_pane(&FocusLeftPane, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "focus-right",
+                        "Right",
+                        Some("Ctrl+2"),
+                        cx.listener(|this, _, window, cx| {
+                            this.focus_right_pane(&FocusRightPane, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "row-width",
+                        format!("{} B/row", self.bytes_per_row()),
+                        Some("Ctrl+B"),
+                        cx.listener(|this, _, window, cx| {
+                            this.next_row_width(&NextRowWidth, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "edit-mode",
+                        self.edit_mode.label(),
+                        Some("Ins"),
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_insert_mode(&ToggleInsertMode, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "endian",
+                        endian_label,
+                        None,
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_endian(&ToggleEndian, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "encoding",
+                        self.encoding.label(),
+                        None,
+                        cx.listener(|this, _, window, cx| {
+                            this.next_encoding(&NextEncoding, window, cx)
+                        }),
+                    )),
+            )
     }
 }
 
@@ -991,6 +1508,11 @@ impl Render for ByteForge {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::compare_next))
+            .on_action(cx.listener(Self::goto))
+            .on_action(cx.listener(Self::toggle_split))
+            .on_action(cx.listener(Self::move_to_other_split))
+            .on_action(cx.listener(Self::focus_left_pane))
+            .on_action(cx.listener(Self::focus_right_pane))
             .on_action(cx.listener(Self::toggle_endian))
             .on_action(cx.listener(Self::next_encoding))
             .on_action(cx.listener(Self::next_row_width))
@@ -1013,36 +1535,41 @@ impl Render for ByteForge {
                     .child(self.render_hex_view(cx))
                     .child(self.render_inspector()),
             )
-            .child(self.render_status())
+            .child(self.render_status(cx))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Keystroke, TestAppContext, WindowHandle};
+    use gpui::{AvailableSpace, Keystroke, TestAppContext, WindowHandle, point, size};
 
     fn bind_test_keys(cx: &mut App) {
         cx.bind_keys([
-            KeyBinding::new("secondary-c", CopyHex, Some("ByteForge")),
-            KeyBinding::new("secondary-shift-c", CopyText, Some("ByteForge")),
-            KeyBinding::new("secondary-x", Cut, Some("ByteForge")),
-            KeyBinding::new("secondary-z", Undo, Some("ByteForge")),
-            KeyBinding::new("secondary-shift-z", Redo, Some("ByteForge")),
-            KeyBinding::new("secondary-v", PasteHex, Some("ByteForge")),
-            KeyBinding::new("secondary-shift-v", PasteText, Some("ByteForge")),
-            KeyBinding::new("delete", DeleteSelection, Some("ByteForge")),
-            KeyBinding::new("secondary-a", SelectAll, Some("ByteForge")),
-            KeyBinding::new("secondary-f", FindNext, Some("ByteForge")),
-            KeyBinding::new("secondary-d", CompareNext, Some("ByteForge")),
-            KeyBinding::new("secondary-b", NextRowWidth, Some("ByteForge")),
-            KeyBinding::new("insert", ToggleInsertMode, Some("ByteForge")),
-            KeyBinding::new("left", MoveLeft, Some("ByteForge")),
-            KeyBinding::new("right", MoveRight, Some("ByteForge")),
-            KeyBinding::new("up", MoveUp, Some("ByteForge")),
-            KeyBinding::new("down", MoveDown, Some("ByteForge")),
-            KeyBinding::new("shift-left", SelectLeft, Some("ByteForge")),
-            KeyBinding::new("shift-right", SelectRight, Some("ByteForge")),
+            KeyBinding::new("secondary-c", CopyHex, None),
+            KeyBinding::new("secondary-shift-c", CopyText, None),
+            KeyBinding::new("secondary-x", Cut, None),
+            KeyBinding::new("secondary-z", Undo, None),
+            KeyBinding::new("secondary-y", Redo, None),
+            KeyBinding::new("secondary-v", PasteHex, None),
+            KeyBinding::new("secondary-shift-v", PasteText, None),
+            KeyBinding::new("delete", DeleteSelection, None),
+            KeyBinding::new("secondary-a", SelectAll, None),
+            KeyBinding::new("secondary-f", FindNext, None),
+            KeyBinding::new("secondary-g", Goto, None),
+            KeyBinding::new("secondary-d", CompareNext, None),
+            KeyBinding::new("secondary-\\", ToggleSplit, None),
+            KeyBinding::new("secondary-m", MoveToOtherSplit, None),
+            KeyBinding::new("secondary-1", FocusLeftPane, None),
+            KeyBinding::new("secondary-2", FocusRightPane, None),
+            KeyBinding::new("secondary-b", NextRowWidth, None),
+            KeyBinding::new("insert", ToggleInsertMode, None),
+            KeyBinding::new("left", MoveLeft, None),
+            KeyBinding::new("right", MoveRight, None),
+            KeyBinding::new("up", MoveUp, None),
+            KeyBinding::new("down", MoveDown, None),
+            KeyBinding::new("shift-left", SelectLeft, None),
+            KeyBinding::new("shift-right", SelectRight, None),
         ]);
     }
 
@@ -1088,6 +1615,38 @@ mod tests {
                 assert_eq!(view.cursor, 0);
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn hex_view_draws_rows_and_tracks_scroll_size(cx: &mut TestAppContext) {
+        let bytes = (0..4096).map(|ix| (ix % 251) as u8).collect();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            ByteForge::with_documents(vec![ByteDocument::from_bytes("visible.bin", bytes)], cx)
+        });
+
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(
+                AvailableSpace::Definite(px(900.0)),
+                AvailableSpace::Definite(px(520.0)),
+            ),
+            |_, _| view.clone(),
+        );
+
+        view.update(cx, |view, _| {
+            let scroll_state = view.left_scroll_handle.0.borrow();
+            let item_size = scroll_state
+                .last_item_size
+                .expect("hex uniform list should be laid out during draw");
+            assert!(
+                item_size.item.height > gpui::Pixels::ZERO,
+                "hex rows must have visible height"
+            );
+            assert!(
+                item_size.contents.height > item_size.item.height,
+                "large document should produce scrollable list content"
+            );
+        });
     }
 
     #[gpui::test]
@@ -1225,6 +1784,152 @@ mod tests {
                 assert_eq!(doc_bytes(view), b"abcdef");
             })
             .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-y").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.active_doc().unwrap().is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn eof_cursor_append_and_cursor_delete(cx: &mut TestAppContext) {
+        let window = open_test_window(
+            cx,
+            vec![ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec())],
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                view.set_cursor(6, false, cx);
+                assert_eq!(view.cursor, 6);
+                assert_eq!(view.selected_or_cursor_range(), Some(6..6));
+
+                view.toggle_insert_mode(&ToggleInsertMode, window, cx);
+                view.apply_bytes(b"XY".to_vec()).unwrap();
+                assert_eq!(doc_bytes(view), b"abcdefXY");
+                assert_eq!(view.cursor, 8);
+
+                view.set_cursor(1, false, cx);
+                view.delete_selection(&DeleteSelection, window, cx);
+                assert_eq!(doc_bytes(view), b"acdefXY");
+                assert_eq!(view.cursor, 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn goto_and_find_scroll_to_target(cx: &mut TestAppContext) {
+        let bytes = (0..512).map(|ix| (ix % 251) as u8).collect();
+        let window = open_test_window(cx, vec![ByteDocument::from_bytes("sample.bin", bytes)]);
+
+        window
+            .update(cx, |view, window, cx| {
+                view.goto(&Goto, window, cx);
+                view.goto_input = "0x80".to_string();
+                view.confirm_goto(cx);
+                assert_eq!(view.cursor, 0x80);
+                assert_eq!(
+                    view.left_scroll_handle
+                        .0
+                        .borrow()
+                        .deferred_scroll_to_item
+                        .unwrap()
+                        .item_index,
+                    8
+                );
+
+                cx.write_to_clipboard(ClipboardItem::new_string("FA 00 01".to_string()));
+                view.find_next(&FindNext, window, cx);
+                assert_eq!(view.selection_range(), Some(250..253));
+                assert_eq!(
+                    view.left_scroll_handle
+                        .0
+                        .borrow()
+                        .deferred_scroll_to_item
+                        .unwrap()
+                        .item_index,
+                    15
+                );
+
+                view.goto(&Goto, window, cx);
+                view.goto_input = "9999".to_string();
+                view.confirm_goto(cx);
+                assert_eq!(view.cursor, 512);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn split_panes_can_focus_and_move_open_files(cx: &mut TestAppContext) {
+        let window = open_test_window(
+            cx,
+            vec![
+                ByteDocument::from_bytes("left.bin", b"left".to_vec()),
+                ByteDocument::from_bytes("right.bin", b"right".to_vec()),
+            ],
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                view.toggle_split(&ToggleSplit, window, cx);
+                assert!(view.split);
+                assert_eq!(view.active_ix_for(PaneSide::Left), Some(0));
+                assert_eq!(view.active_ix_for(PaneSide::Right), Some(1));
+
+                view.focus_right_pane(&FocusRightPane, window, cx);
+                assert_eq!(view.focused_pane, PaneSide::Right);
+                assert_eq!(view.active_doc().unwrap().name(), "right.bin");
+
+                view.activate_doc(0, cx);
+                assert_eq!(view.active_ix_for(PaneSide::Right), Some(0));
+
+                view.move_to_other_split(&MoveToOtherSplit, window, cx);
+                assert_eq!(view.focused_pane, PaneSide::Left);
+                assert_eq!(view.active_ix_for(PaneSide::Left), Some(0));
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-2").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.focused_pane, PaneSide::Right);
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-1").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.focused_pane, PaneSide::Left);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn shift_click_and_drag_selection_share_ui_state_path(cx: &mut TestAppContext) {
+        let window = open_test_window(
+            cx,
+            vec![ByteDocument::from_bytes(
+                "sample.bin",
+                b"0123456789".to_vec(),
+            )],
+        );
+
+        window
+            .update(cx, |view, _, cx| {
+                view.begin_cell_selection(0, PaneSide::Left, 2, false, cx);
+                view.drag_cell_selection(0, PaneSide::Left, 5, cx);
+                assert_eq!(view.selection_range(), Some(2..6));
+                assert_eq!(view.cursor, 5);
+                view.finish_cell_selection(cx);
+                assert!(view.drag_anchor.is_none());
+
+                view.set_cursor(1, false, cx);
+                view.begin_cell_selection(0, PaneSide::Left, 4, true, cx);
+                assert_eq!(view.selection_range(), Some(1..5));
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -1270,8 +1975,40 @@ mod tests {
     }
 }
 
-fn byte_cell_id(offset: u64, lane: u64) -> usize {
-    usize::try_from(offset.saturating_mul(2).saturating_add(lane)).unwrap_or(usize::MAX)
+fn pane_index(side: PaneSide) -> usize {
+    match side {
+        PaneSide::Left => 0,
+        PaneSide::Right => 1,
+    }
+}
+
+fn byte_cell_id(side: PaneSide, offset: u64, lane: u64) -> usize {
+    let side_offset = pane_index(side) as u64;
+    usize::try_from(
+        offset
+            .saturating_mul(4)
+            .saturating_add(side_offset.saturating_mul(2))
+            .saturating_add(lane),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+fn parse_offset(input: &str) -> Option<u64> {
+    let trimmed = input.trim().replace('_', "");
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed
+            .parse::<u64>()
+            .ok()
+            .or_else(|| u64::from_str_radix(&trimmed, 16).ok())
+    }
 }
 
 pub fn run_app() {
@@ -1280,28 +2017,33 @@ pub fn run_app() {
         cx.activate(true);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
-            KeyBinding::new("secondary-o", OpenFiles, Some("ByteForge")),
-            KeyBinding::new("secondary-s", SaveAs, Some("ByteForge")),
-            KeyBinding::new("secondary-c", CopyHex, Some("ByteForge")),
-            KeyBinding::new("secondary-shift-c", CopyText, Some("ByteForge")),
-            KeyBinding::new("secondary-x", Cut, Some("ByteForge")),
-            KeyBinding::new("secondary-z", Undo, Some("ByteForge")),
-            KeyBinding::new("secondary-shift-z", Redo, Some("ByteForge")),
-            KeyBinding::new("secondary-v", PasteHex, Some("ByteForge")),
-            KeyBinding::new("secondary-shift-v", PasteText, Some("ByteForge")),
-            KeyBinding::new("delete", DeleteSelection, Some("ByteForge")),
-            KeyBinding::new("backspace", DeleteSelection, Some("ByteForge")),
-            KeyBinding::new("secondary-a", SelectAll, Some("ByteForge")),
-            KeyBinding::new("secondary-f", FindNext, Some("ByteForge")),
-            KeyBinding::new("secondary-d", CompareNext, Some("ByteForge")),
-            KeyBinding::new("secondary-b", NextRowWidth, Some("ByteForge")),
-            KeyBinding::new("insert", ToggleInsertMode, Some("ByteForge")),
-            KeyBinding::new("left", MoveLeft, Some("ByteForge")),
-            KeyBinding::new("right", MoveRight, Some("ByteForge")),
-            KeyBinding::new("up", MoveUp, Some("ByteForge")),
-            KeyBinding::new("down", MoveDown, Some("ByteForge")),
-            KeyBinding::new("shift-left", SelectLeft, Some("ByteForge")),
-            KeyBinding::new("shift-right", SelectRight, Some("ByteForge")),
+            KeyBinding::new("secondary-o", OpenFiles, None),
+            KeyBinding::new("secondary-s", SaveAs, None),
+            KeyBinding::new("secondary-c", CopyHex, None),
+            KeyBinding::new("secondary-shift-c", CopyText, None),
+            KeyBinding::new("secondary-x", Cut, None),
+            KeyBinding::new("secondary-z", Undo, None),
+            KeyBinding::new("secondary-y", Redo, None),
+            KeyBinding::new("secondary-v", PasteHex, None),
+            KeyBinding::new("secondary-shift-v", PasteText, None),
+            KeyBinding::new("delete", DeleteSelection, None),
+            KeyBinding::new("backspace", DeleteSelection, None),
+            KeyBinding::new("secondary-a", SelectAll, None),
+            KeyBinding::new("secondary-f", FindNext, None),
+            KeyBinding::new("secondary-g", Goto, None),
+            KeyBinding::new("secondary-d", CompareNext, None),
+            KeyBinding::new("secondary-\\", ToggleSplit, None),
+            KeyBinding::new("secondary-m", MoveToOtherSplit, None),
+            KeyBinding::new("secondary-1", FocusLeftPane, None),
+            KeyBinding::new("secondary-2", FocusRightPane, None),
+            KeyBinding::new("secondary-b", NextRowWidth, None),
+            KeyBinding::new("insert", ToggleInsertMode, None),
+            KeyBinding::new("left", MoveLeft, None),
+            KeyBinding::new("right", MoveRight, None),
+            KeyBinding::new("up", MoveUp, None),
+            KeyBinding::new("down", MoveDown, None),
+            KeyBinding::new("shift-left", SelectLeft, None),
+            KeyBinding::new("shift-right", SelectRight, None),
             KeyBinding::new("secondary-q", Quit, None),
         ]);
         cx.set_menus(vec![
@@ -1328,6 +2070,7 @@ pub fn run_app() {
                     MenuItem::action("Paste Text", PasteText),
                     MenuItem::action("Delete Selection", DeleteSelection),
                     MenuItem::action("Select All", SelectAll),
+                    MenuItem::action("Goto Offset", Goto),
                 ],
             },
             Menu {
@@ -1335,6 +2078,10 @@ pub fn run_app() {
                 items: vec![
                     MenuItem::action("Find Clipboard", FindNext),
                     MenuItem::action("Compare Next File", CompareNext),
+                    MenuItem::action("Toggle Split View", ToggleSplit),
+                    MenuItem::action("Move Active File To Other Pane", MoveToOtherSplit),
+                    MenuItem::action("Focus Left Pane", FocusLeftPane),
+                    MenuItem::action("Focus Right Pane", FocusRightPane),
                     MenuItem::action("Next Row Width", NextRowWidth),
                     MenuItem::action("Toggle Insert Mode", ToggleInsertMode),
                     MenuItem::action("Next Encoding", NextEncoding),
