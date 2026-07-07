@@ -26,6 +26,7 @@ actions!(
     byteforge,
     [
         OpenFiles,
+        Save,
         SaveAs,
         CopyHex,
         CopyText,
@@ -83,6 +84,13 @@ impl PaneSide {
         match self {
             Self::Left => "Left",
             Self::Right => "Right",
+        }
+    }
+
+    fn ja_label(self) -> &'static str {
+        match self {
+            Self::Left => "左",
+            Self::Right => "右",
         }
     }
 }
@@ -147,7 +155,7 @@ impl ByteForge {
             test_open_paths: None,
             #[cfg(test)]
             test_save_path: None,
-            status: "Open one or more files to begin.".into(),
+            status: "ファイルを開いて開始してください。".into(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -177,7 +185,7 @@ impl ByteForge {
             test_open_paths: None,
             #[cfg(test)]
             test_save_path: None,
-            status: "Ready.".into(),
+            status: "準備完了。".into(),
             focus_handle: cx.focus_handle(),
         }
     }
@@ -250,6 +258,57 @@ impl ByteForge {
             .scroll_to_item(row, ScrollStrategy::Center);
     }
 
+    fn row_count_for(&self, doc_ix: usize) -> usize {
+        self.docs
+            .get(doc_ix)
+            .map(|doc| {
+                (doc.len() / self.bytes_per_row() as u64 + 1).min(usize::MAX as u64) as usize
+            })
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn scroll_page_for(
+        &mut self,
+        side: PaneSide,
+        doc_ix: usize,
+        direction: i64,
+        cx: &mut Context<Self>,
+    ) {
+        let row_count = self.row_count_for(doc_ix);
+        let handle = self.scroll_handle_for(side);
+        let (current, visible_rows) = {
+            let state = handle.0.borrow();
+            let current = state
+                .deferred_scroll_to_item
+                .as_ref()
+                .map(|deferred| deferred.item_index)
+                .unwrap_or_else(|| state.base_handle.logical_scroll_top().0);
+            let visible_rows = state
+                .last_item_size
+                .map(|size| {
+                    let row_height = size.contents.height * (1.0 / row_count as f32);
+                    (size.item.height / row_height).floor().max(1.0) as usize
+                })
+                .unwrap_or(self.bytes_per_row());
+            (current.min(row_count - 1), visible_rows.max(1))
+        };
+
+        let target = if direction.is_negative() {
+            current.saturating_sub(visible_rows)
+        } else {
+            current.saturating_add(visible_rows).min(row_count - 1)
+        };
+        handle.scroll_to_item_strict(target, ScrollStrategy::Top);
+        self.focus_pane(side);
+        self.set_status(format!(
+            "{}ペインを {} 行目へスクロールしました。",
+            side.ja_label(),
+            target
+        ));
+        cx.notify();
+    }
+
     fn clamp_cursor(&mut self) {
         let len = self.active_doc().map(ByteDocument::len).unwrap_or(0);
         self.cursor = self.cursor.min(len);
@@ -294,7 +353,9 @@ impl ByteForge {
         self.selection = Some(Selection::new(offset, end));
         self.pending_hex = None;
         self.scroll_to_cursor();
-        self.set_status(format!("Selected format field 0x{offset:X}..0x{end:X}."));
+        self.set_status(format!(
+            "形式フィールド 0x{offset:X}..0x{end:X} を選択しました。"
+        ));
         cx.notify();
     }
 
@@ -391,9 +452,9 @@ impl ByteForge {
             self.cursor = 0;
             self.selection = None;
             self.compare_with = None;
-            self.set_status(format!("Opened {opened} file(s)."));
+            self.set_status(format!("{opened} 個のファイルを開きました。"));
         } else if let Some(err) = last_error {
-            self.set_status(err);
+            self.set_status(format!("ファイルを開けませんでした: {err}"));
         }
     }
 
@@ -405,6 +466,25 @@ impl ByteForge {
         cx.notify();
     }
 
+    fn save(&mut self, _: &Save, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self
+            .active_doc()
+            .and_then(ByteDocument::path)
+            .map(Path::to_path_buf);
+        if let Some(path) = path {
+            self.save_active_as_path(&path);
+            cx.notify();
+        } else {
+            self.save_as(&SaveAs, window, cx);
+        }
+    }
+
+    fn save_as_start_directory(&self) -> Option<&Path> {
+        self.active_doc()
+            .and_then(ByteDocument::path)
+            .and_then(Path::parent)
+    }
+
     fn save_as(&mut self, _: &SaveAs, _: &mut Window, cx: &mut Context<Self>) {
         #[cfg(test)]
         if let Some(path) = self.test_save_path.take() {
@@ -413,7 +493,12 @@ impl ByteForge {
             return;
         }
 
-        let Some(path) = rfd::FileDialog::new().save_file() else {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(parent) = self.save_as_start_directory() {
+            dialog = dialog.set_directory(parent);
+        }
+
+        let Some(path) = dialog.save_file() else {
             return;
         };
         self.save_active_as_path(&path);
@@ -422,9 +507,9 @@ impl ByteForge {
 
     fn save_active_as_path(&mut self, path: &Path) {
         match self.active_doc_mut().map(|doc| doc.save_as(path)) {
-            Some(Ok(())) => self.set_status("Saved."),
-            Some(Err(err)) => self.set_status(format!("Save failed: {err:#}")),
-            None => self.set_status("No active file."),
+            Some(Ok(())) => self.set_status("保存しました。"),
+            Some(Err(err)) => self.set_status(format!("保存に失敗しました: {err:#}")),
+            None => self.set_status("アクティブなファイルがありません。"),
         }
     }
 
@@ -442,7 +527,7 @@ impl ByteForge {
             .collect::<Vec<_>>()
             .join(" ");
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.set_status("Copied hex.");
+        self.set_status("16進形式でコピーしました。");
         cx.notify();
     }
 
@@ -465,14 +550,14 @@ impl ByteForge {
             })
             .collect();
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.set_status("Copied text preview.");
+        self.set_status("テキストプレビューをコピーしました。");
         cx.notify();
     }
 
     fn cut(&mut self, action: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         self.copy_hex(&CopyHex, window, cx);
         self.delete_selection(&DeleteSelection, window, cx);
-        self.set_status("Cut selection as hex.");
+        self.set_status("選択範囲を16進形式で切り取りました。");
         let _ = action;
     }
 
@@ -482,10 +567,10 @@ impl ByteForge {
                 self.clamp_cursor();
                 self.selection = None;
                 self.pending_hex = None;
-                self.set_status("Undo.");
+                self.set_status("元に戻しました。");
             }
-            Some(false) => self.set_status("Nothing to undo."),
-            None => self.set_status("No active file."),
+            Some(false) => self.set_status("元に戻す操作はありません。"),
+            None => self.set_status("アクティブなファイルがありません。"),
         }
         cx.notify();
     }
@@ -496,49 +581,54 @@ impl ByteForge {
                 self.clamp_cursor();
                 self.selection = None;
                 self.pending_hex = None;
-                self.set_status("Redo.");
+                self.set_status("やり直しました。");
             }
-            Some(false) => self.set_status("Nothing to redo."),
-            None => self.set_status("No active file."),
+            Some(false) => self.set_status("やり直す操作はありません。"),
+            None => self.set_status("アクティブなファイルがありません。"),
         }
         cx.notify();
     }
 
     fn paste_hex(&mut self, _: &PasteHex, _: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            self.set_status("Clipboard does not contain text.");
+            self.set_status("クリップボードにテキストがありません。");
             cx.notify();
             return;
         };
         match parse_hex_bytes(&text).and_then(|bytes| self.apply_bytes(bytes)) {
-            Ok(count) => self.set_status(format!("Pasted {count} byte(s) from hex.")),
-            Err(err) => self.set_status(format!("Paste hex failed: {err:#}")),
+            Ok(count) => self.set_status(format!("16進形式から {count} バイト貼り付けました。")),
+            Err(err) => self.set_status(format!("16進貼り付けに失敗しました: {err:#}")),
         }
         cx.notify();
     }
 
     fn paste_text(&mut self, _: &PasteText, _: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            self.set_status("Clipboard does not contain text.");
+            self.set_status("クリップボードにテキストがありません。");
             cx.notify();
             return;
         };
         let len = text.len();
         match self.apply_bytes(text.into_bytes()) {
-            Ok(_) => self.set_status(format!("Pasted {len} text byte(s).")),
-            Err(err) => self.set_status(format!("Paste text failed: {err:#}")),
+            Ok(_) => self.set_status(format!("{len} バイトのテキストを貼り付けました。")),
+            Err(err) => self.set_status(format!("テキスト貼り付けに失敗しました: {err:#}")),
         }
         cx.notify();
     }
 
     fn delete_selection(&mut self, _: &DeleteSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.goto_open {
+            self.set_status("Goto入力中です。ファイルのバイトは削除しません。");
+            cx.notify();
+            return;
+        }
         let Some(range) = self.selected_or_cursor_range() else {
-            self.set_status("No byte to delete.");
+            self.set_status("削除するバイトがありません。");
             cx.notify();
             return;
         };
         if range.is_empty() {
-            self.set_status("No byte at cursor.");
+            self.set_status("カーソル位置にバイトがありません。");
             cx.notify();
             return;
         }
@@ -547,10 +637,10 @@ impl ByteForge {
                 self.cursor = range.start;
                 self.selection = None;
                 self.clamp_cursor();
-                self.set_status("Deleted selection.");
+                self.set_status("選択範囲を削除しました。");
             }
-            Some(Err(err)) => self.set_status(format!("Delete failed: {err:#}")),
-            None => self.set_status("No active file."),
+            Some(Err(err)) => self.set_status(format!("削除に失敗しました: {err:#}")),
+            None => self.set_status("アクティブなファイルがありません。"),
         }
         cx.notify();
     }
@@ -562,14 +652,14 @@ impl ByteForge {
         if len > 0 {
             self.selection = Some(Selection::new(0, len - 1));
             self.cursor = len - 1;
-            self.set_status(format!("Selected {len} byte(s)."));
+            self.set_status(format!("{len} バイトを選択しました。"));
         }
         cx.notify();
     }
 
     fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            self.set_status("Copy search bytes or text to the clipboard first.");
+            self.set_status("検索するバイト列またはテキストを先にコピーしてください。");
             cx.notify();
             return;
         };
@@ -584,9 +674,12 @@ impl ByteForge {
                 self.cursor = offset;
                 self.selection = Some(Selection::new(offset, offset + needle.len() as u64 - 1));
                 self.scroll_to_cursor();
-                self.set_status(format!("Found {} byte(s) at 0x{offset:X}.", needle.len()));
+                self.set_status(format!(
+                    "{} バイトの一致を 0x{offset:X} で見つけました。",
+                    needle.len()
+                ));
             }
-            None => self.set_status("Pattern not found."),
+            None => self.set_status("一致するパターンは見つかりませんでした。"),
         }
         cx.notify();
     }
@@ -594,7 +687,7 @@ impl ByteForge {
     fn compare_next(&mut self, _: &CompareNext, _: &mut Window, cx: &mut Context<Self>) {
         if self.docs.len() < 2 {
             self.compare_with = None;
-            self.set_status("Open at least two files to compare.");
+            self.set_status("比較するには2個以上のファイルを開いてください。");
             cx.notify();
             return;
         }
@@ -610,7 +703,7 @@ impl ByteForge {
             next
         });
         let name = self.docs[self.compare_with.unwrap()].name();
-        self.set_status(format!("Comparing against {name}."));
+        self.set_status(format!("{name} と比較しています。"));
         cx.notify();
     }
 
@@ -645,7 +738,7 @@ impl ByteForge {
         self.goto_open = true;
         self.goto_input = format!("0x{:X}", self.cursor);
         self.pending_hex = None;
-        self.set_status("Goto: type an offset, Enter to jump, Esc to cancel.");
+        self.set_status("Goto: オフセットを入力し、Enterで移動、Escでキャンセルします。");
         cx.notify();
     }
 
@@ -659,10 +752,10 @@ impl ByteForge {
                     (!self.docs.is_empty()).then_some(self.active)
                 }
             });
-            self.set_status("Split view enabled.");
+            self.set_status("分割表示を有効にしました。");
         } else {
             self.focused_pane = PaneSide::Left;
-            self.set_status("Split view disabled.");
+            self.set_status("分割表示を無効にしました。");
         }
         cx.notify();
     }
@@ -692,8 +785,8 @@ impl ByteForge {
             }
         }
         self.set_status(format!(
-            "Moved active file to {} pane.",
-            self.focused_pane.label()
+            "アクティブなファイルを{}ペインへ移動しました。",
+            self.focused_pane.ja_label()
         ));
         cx.notify();
     }
@@ -750,9 +843,15 @@ impl ByteForge {
         self.set_cursor(next, extend, cx);
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.goto_open {
             self.handle_goto_key(event, cx);
+            return;
+        }
+
+        if event.keystroke.key.as_str() == "backspace" {
+            self.delete_selection(&DeleteSelection, window, cx);
+            cx.stop_propagation();
             return;
         }
 
@@ -780,7 +879,7 @@ impl ByteForge {
             }
             "escape" => {
                 self.goto_open = false;
-                self.set_status("Goto cancelled.");
+                self.set_status("Gotoをキャンセルしました。");
                 cx.notify();
                 cx.stop_propagation();
             }
@@ -806,7 +905,7 @@ impl ByteForge {
 
     fn confirm_goto(&mut self, cx: &mut Context<Self>) {
         let Some(target) = parse_offset(&self.goto_input) else {
-            self.set_status("Goto failed: enter decimal or 0x-prefixed hex.");
+            self.set_status("Gotoに失敗しました。10進数または0x始まりの16進数を入力してください。");
             cx.notify();
             return;
         };
@@ -816,7 +915,7 @@ impl ByteForge {
         self.goto_open = false;
         self.pending_hex = None;
         self.scroll_to_cursor();
-        self.set_status(format!("Moved to 0x{:X}.", self.cursor));
+        self.set_status(format!("0x{:X} へ移動しました。", self.cursor));
         cx.notify();
     }
 
@@ -828,12 +927,12 @@ impl ByteForge {
         if let Some(high) = self.pending_hex.take() {
             let byte = (high << 4) | nibble;
             match self.apply_bytes(vec![byte]) {
-                Ok(_) => self.set_status(format!("Wrote 0x{byte:02X}.")),
-                Err(err) => self.set_status(format!("Write failed: {err:#}")),
+                Ok(_) => self.set_status(format!("0x{byte:02X} を書き込みました。")),
+                Err(err) => self.set_status(format!("書き込みに失敗しました: {err:#}")),
             }
         } else {
             self.pending_hex = Some(nibble);
-            self.set_status(format!("Pending hex nibble {:X}_", nibble));
+            self.set_status(format!("16進入力待機中: {:X}_", nibble));
         }
         cx.notify();
     }
@@ -914,9 +1013,15 @@ impl ByteForge {
                         cx.listener(|this, _, window, cx| this.open_files(&OpenFiles, window, cx)),
                     ))
                     .child(self.toolbar_button(
+                        "save",
+                        "Save",
+                        Some("Ctrl+S"),
+                        cx.listener(|this, _, window, cx| this.save(&Save, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
                         "save-as",
                         "Save As",
-                        Some("Ctrl+S"),
+                        Some("Ctrl+Shift+S"),
                         cx.listener(|this, _, window, cx| this.save_as(&SaveAs, window, cx)),
                     ))
                     .child(self.toolbar_button(
@@ -1055,7 +1160,7 @@ impl ByteForge {
                 .py_2()
                 .bg(rgb(0x15181d))
                 .text_color(rgb(0x8792a2))
-                .child("No file open")
+                .child("ファイルが開かれていません")
                 .into_any_element();
         }
 
@@ -1109,15 +1214,14 @@ impl ByteForge {
                 .justify_center()
                 .bg(rgb(0x101318))
                 .text_color(rgb(0x8792a2))
-                .child("Open files with the toolbar, menu, or Ctrl+O.")
+                .child("ツールバー、メニュー、または Ctrl+O でファイルを開いてください。")
                 .into_any_element();
         };
-        let Some(doc) = self.docs.get(doc_ix) else {
+        if self.docs.get(doc_ix).is_none() {
             return div().flex_1().into_any_element();
-        };
+        }
 
-        let bytes_per_row = self.bytes_per_row();
-        let row_count = (doc.len() / bytes_per_row as u64 + 1).min(usize::MAX as u64) as usize;
+        let row_count = self.row_count_for(doc_ix);
         let focus_color = if self.focused_pane == side {
             rgb(0x3f7ab7)
         } else {
@@ -1138,28 +1242,6 @@ impl ByteForge {
                 cx.notify();
             }))
             .child(self.render_tabs(side, cx))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(0x15181d))
-                    .text_xs()
-                    .text_color(rgb(0xb8c1cf))
-                    .child(format!(
-                        "{} pane: {}{}",
-                        side.label(),
-                        doc.name(),
-                        if doc.is_dirty() { "*" } else { "" }
-                    ))
-                    .child(if self.focused_pane == side {
-                        "focused"
-                    } else {
-                        ""
-                    }),
-            )
             .child(
                 div()
                     .id(("hex-scroll", pane_index(side)))
@@ -1188,15 +1270,65 @@ impl ByteForge {
                             .h_full(),
                         ),
                     )
-                    .child(self.render_hex_scrollbar(doc_ix, side)),
+                    .child(self.render_hex_scrollbar(doc_ix, side, cx)),
             )
             .into_any_element()
     }
 
-    fn render_hex_scrollbar(&self, _doc_ix: usize, side: PaneSide) -> AnyElement {
+    fn render_hex_scrollbar(
+        &self,
+        doc_ix: usize,
+        side: PaneSide,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let row_count = self.row_count_for(doc_ix);
+        let handle = self.scroll_handle_for(side);
+        let (top_spacer, thumb_height, bottom_spacer) = {
+            let state = handle.0.borrow();
+            if let Some(size) = state.last_item_size {
+                let track = size.item.height;
+                let content = if size.contents.height > track {
+                    size.contents.height
+                } else {
+                    track
+                };
+                let row_height = content * (1.0 / row_count as f32);
+                let current_top = state
+                    .deferred_scroll_to_item
+                    .as_ref()
+                    .map(|deferred| row_height * deferred.item_index)
+                    .unwrap_or_else(|| {
+                        let (ix, offset) = state.base_handle.logical_scroll_top();
+                        row_height * ix + offset
+                    });
+                let mut max_scroll = content - track;
+                if max_scroll < px(1.0) {
+                    max_scroll = px(1.0);
+                }
+                let ratio = (current_top / max_scroll).clamp(0.0, 1.0);
+                let mut thumb = track * (track / content);
+                if thumb < px(32.0) {
+                    thumb = px(32.0);
+                }
+                if thumb > track {
+                    thumb = track;
+                }
+                let top = (track - thumb) * ratio;
+                let mut bottom = track - thumb - top;
+                if bottom < px(0.0) {
+                    bottom = px(0.0);
+                }
+                (top, thumb, bottom)
+            } else {
+                (px(0.0), px(44.0), px(0.0))
+            }
+        };
+
         div()
+            .id(("hex-scrollbar", pane_index(side)))
             .debug_selector(move || format!("hex-scrollbar-{}", side.label().to_ascii_lowercase()))
             .w(px(10.0))
+            .flex_shrink_0()
             .h_full()
             .flex()
             .flex_col()
@@ -1204,9 +1336,56 @@ impl ByteForge {
             .bg(rgb(0x171b21))
             .border_l_1()
             .border_color(rgb(0x303741))
-            .child(div().flex_grow())
-            .child(div().w(px(6.0)).h(px(44.0)).rounded_sm().bg(rgb(0x5d6878)))
-            .child(div().flex_grow())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.scroll_page_for(side, doc_ix, 1, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .child(
+                div()
+                    .id(("hex-scrollbar-top", pane_index(side)))
+                    .w_full()
+                    .h(top_spacer)
+                    .bg(rgb(0x171b21))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.scroll_page_for(side, doc_ix, -1, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(div().w_full().h_full().text_color(rgb(0x171b21)).child(".")),
+            )
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(thumb_height)
+                    .rounded_sm()
+                    .bg(rgb(0x5d6878)),
+            )
+            .child(
+                div()
+                    .id(("hex-scrollbar-bottom", pane_index(side)))
+                    .debug_selector(move || {
+                        format!("hex-scrollbar-bottom-{}", side.label().to_ascii_lowercase())
+                    })
+                    .w_full()
+                    .h(bottom_spacer)
+                    .flex_1()
+                    .bg(rgb(0x171b21))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.scroll_page_for(side, doc_ix, 1, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(div().w_full().h_full().text_color(rgb(0x171b21)).child(".")),
+            )
             .into_any_element()
     }
 
@@ -1728,6 +1907,7 @@ impl Render for ByteForge {
             }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::open_files))
+            .on_action(cx.listener(Self::save))
             .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::copy_hex))
             .on_action(cx.listener(Self::copy_text))
@@ -1785,7 +1965,8 @@ mod tests {
         gpui_component::init(cx);
         cx.bind_keys([
             KeyBinding::new("secondary-o", OpenFiles, None),
-            KeyBinding::new("secondary-s", SaveAs, None),
+            KeyBinding::new("secondary-s", Save, None),
+            KeyBinding::new("secondary-shift-s", SaveAs, None),
             KeyBinding::new("secondary-c", CopyHex, None),
             KeyBinding::new("secondary-shift-c", CopyText, None),
             KeyBinding::new("secondary-x", Cut, None),
@@ -1889,7 +2070,24 @@ mod tests {
         let bounds = cx
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("missing button bounds for {selector}"));
+        assert!(
+            bounds.size.width > gpui::Pixels::ZERO && bounds.size.height > gpui::Pixels::ZERO,
+            "{selector} has no clickable size: {:?}",
+            bounds
+        );
         cx.simulate_click(bounds.center(), Modifiers::default());
+    }
+
+    fn mouse_down_selector(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing bounds for {selector}"));
+        assert!(
+            bounds.size.width > gpui::Pixels::ZERO && bounds.size.height > gpui::Pixels::ZERO,
+            "{selector} has no clickable size: {:?}",
+            bounds
+        );
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
     }
 
     fn sample_png_document() -> ByteDocument {
@@ -1997,6 +2195,51 @@ mod tests {
     }
 
     #[gpui::test]
+    fn visible_scrollbar_click_pages_hex_view(cx: &mut TestAppContext) {
+        cx.update(bind_test_keys);
+        let bytes = (0..4096).map(|ix| (ix % 251) as u8).collect();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            ByteForge::with_documents(vec![ByteDocument::from_bytes("scroll.bin", bytes)], cx)
+        });
+
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
+        mouse_down_selector(cx, "hex-scrollbar-bottom-left");
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
+        view.update(cx, |view, _| {
+            assert!(view.status.contains("左ペインを "));
+            assert!(view.status.contains("行目へスクロールしました。"));
+            assert!(!view.status.contains(" 0 行目"));
+        });
+    }
+
+    #[gpui::test]
+    fn save_as_starts_in_active_file_directory(cx: &mut TestAppContext) {
+        let mut open_path = std::env::temp_dir();
+        open_path.push(format!(
+            "byteforge-save-as-dir-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&open_path, b"opened").unwrap();
+
+        let window = open_test_window(cx, vec![ByteDocument::open(&open_path).unwrap()]);
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.save_as_start_directory().unwrap(),
+                    open_path.parent().unwrap()
+                );
+            })
+            .unwrap();
+
+        let _ = std::fs::remove_file(open_path);
+    }
+
+    #[gpui::test]
     fn clicking_format_field_selects_hex_range(cx: &mut TestAppContext) {
         cx.update(bind_test_keys);
         let (view, cx) =
@@ -2009,7 +2252,10 @@ mod tests {
         view.update(cx, |view, _| {
             assert_eq!(view.cursor, 0);
             assert_eq!(view.selection_range(), Some(0..8));
-            assert_eq!(view.status.as_ref(), "Selected format field 0x0..0x7.");
+            assert_eq!(
+                view.status.as_ref(),
+                "形式フィールド 0x0..0x7 を選択しました。"
+            );
         });
     }
 
@@ -2205,6 +2451,15 @@ mod tests {
         });
 
         view.update(cx, |view, _| {
+            view.active_doc_mut()
+                .unwrap()
+                .overwrite(0, b"X".to_vec())
+                .unwrap();
+        });
+        click_button(cx, "button-save");
+        assert_eq!(std::fs::read(&open_path).unwrap(), b"Xpened");
+
+        view.update(cx, |view, _| {
             view.active = 0;
             view.focused_pane = PaneSide::Left;
             view.test_save_path = Some(save_path.clone());
@@ -2361,13 +2616,25 @@ mod tests {
                     view.active_doc().unwrap().name(),
                     open_path.file_name().unwrap().to_string_lossy()
                 );
+                view.active_doc_mut()
+                    .unwrap()
+                    .overwrite(0, b"X".to_vec())
+                    .unwrap();
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-s").unwrap());
+        assert_eq!(std::fs::read(&open_path).unwrap(), b"Xpened");
+
+        window
+            .update(cx, |view, _, _| {
                 view.active = 0;
                 view.focused_pane = PaneSide::Left;
                 view.test_save_path = Some(save_path.clone());
             })
             .unwrap();
 
-        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-s").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-shift-s").unwrap());
         assert_eq!(std::fs::read(&save_path).unwrap(), b"abcdef");
 
         window
@@ -2599,6 +2866,38 @@ mod tests {
     }
 
     #[gpui::test]
+    fn goto_input_backspace_does_not_delete_file_bytes(cx: &mut TestAppContext) {
+        let window = open_test_window(
+            cx,
+            vec![ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec())],
+        );
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-g").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.goto_open);
+                assert_eq!(view.goto_input, "0x0");
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("backspace").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.goto_input, "0x");
+                assert_eq!(doc_bytes(view), b"abcdef");
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("delete").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.goto_open);
+                assert_eq!(doc_bytes(view), b"abcdef");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn split_panes_can_focus_and_move_open_files(cx: &mut TestAppContext) {
         let window = open_test_window(
             cx,
@@ -2742,7 +3041,7 @@ mod tests {
                 assert_eq!(view.active, 0);
                 assert_eq!(view.docs[0].read_range(0, 5), b"first");
                 assert_eq!(view.docs[1].read_range(0, 6), b"second");
-                assert_eq!(view.status.as_ref(), "Opened 2 file(s).");
+                assert_eq!(view.status.as_ref(), "2 個のファイルを開きました。");
             })
             .unwrap();
 
@@ -2794,7 +3093,8 @@ pub fn run_app() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             KeyBinding::new("secondary-o", OpenFiles, None),
-            KeyBinding::new("secondary-s", SaveAs, None),
+            KeyBinding::new("secondary-s", Save, None),
+            KeyBinding::new("secondary-shift-s", SaveAs, None),
             KeyBinding::new("secondary-c", CopyHex, None),
             KeyBinding::new("secondary-shift-c", CopyText, None),
             KeyBinding::new("secondary-x", Cut, None),
@@ -2803,7 +3103,6 @@ pub fn run_app() {
             KeyBinding::new("secondary-v", PasteHex, None),
             KeyBinding::new("secondary-shift-v", PasteText, None),
             KeyBinding::new("delete", DeleteSelection, None),
-            KeyBinding::new("backspace", DeleteSelection, None),
             KeyBinding::new("secondary-a", SelectAll, None),
             KeyBinding::new("secondary-f", FindNext, None),
             KeyBinding::new("secondary-g", Goto, None),
@@ -2829,6 +3128,7 @@ pub fn run_app() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("Open Files...", OpenFiles),
+                    MenuItem::action("Save", Save),
                     MenuItem::action("Save As...", SaveAs),
                     MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),

@@ -19,7 +19,7 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 - Cursor can move to EOF + 1 for appending; the normal cursor position acts as a one-byte selection for Delete/Copy/Find when applicable.
 - Direct hex nibble input in the hex view.
 - Hex and text clipboard formats.
-- Save As that streams the current piece table to disk.
+- Save and Save As operations that stream the current piece table to disk.
 - Inspector panel with offset, integer widths, floats, endian mode, text preview, and clickable read-only file-format fields for PNG, BMP, WAV, GIF, JPEG, and ZIP.
 - Preview encoding toggle: UTF-8, UTF-16LE, UTF-16BE, Shift-JIS, ASCII.
 - Same-offset multi-file comparison highlighting.
@@ -62,7 +62,8 @@ target\release\byteforge.exe path\to\file.bin
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+O` | Open files |
-| `Ctrl+S` | Save As |
+| `Ctrl+S` | Save |
+| `Ctrl+Shift+S` | Save As |
 | `Ctrl+C` | Copy selected bytes as hex |
 | `Ctrl+Shift+C` | Copy selected bytes as text preview |
 | `Ctrl+X` | Cut selected bytes as hex |

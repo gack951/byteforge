@@ -435,13 +435,44 @@ impl ByteDocument {
 
     pub fn save_as(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let mut writer = BufWriter::new(
-            File::create(path).with_context(|| format!("failed to create {}", path.display()))?,
-        );
-        for piece in &self.pieces {
-            writer.write_all(self.source_slice(&piece.source, piece.start..piece.end()))?;
+        let saving_current_mmap = self.path.as_deref().is_some_and(|current| current == path)
+            && matches!(self.original, OriginalBytes::Mmap(_));
+
+        if saving_current_mmap {
+            let bytes = self.read_range(0, self.len as usize);
+            self.original = if bytes.is_empty() {
+                OriginalBytes::Empty
+            } else {
+                OriginalBytes::Memory(Arc::new(bytes.clone()))
+            };
+            self.additions.clear();
+            self.pieces = if self.len == 0 {
+                Vec::new()
+            } else {
+                vec![Piece {
+                    source: Source::Original,
+                    start: 0,
+                    len: self.len,
+                }]
+            };
+
+            let mut writer = BufWriter::new(
+                File::create(path)
+                    .with_context(|| format!("failed to create {}", path.display()))?,
+            );
+            writer.write_all(&bytes)?;
+            writer.flush()?;
+        } else {
+            let mut writer = BufWriter::new(
+                File::create(path)
+                    .with_context(|| format!("failed to create {}", path.display()))?,
+            );
+            for piece in &self.pieces {
+                writer.write_all(self.source_slice(&piece.source, piece.start..piece.end()))?;
+            }
+            writer.flush()?;
         }
-        writer.flush()?;
+
         self.path = Some(path.to_path_buf());
         self.dirty = false;
         self.undo_stack.clear();
@@ -1768,6 +1799,28 @@ mod tests {
         assert_eq!(doc.read_range(0, 16), b"a123456f");
         assert!(doc.undo());
         assert_eq!(doc.read_range(0, 16), b"abcdef");
+    }
+
+    #[test]
+    fn save_opened_mmap_document_back_to_same_path() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "byteforge-core-save-same-path-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"opened").unwrap();
+
+        let mut doc = ByteDocument::open(&path).unwrap();
+        doc.overwrite(0, b"X".to_vec()).unwrap();
+        doc.save_as(&path).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"Xpened");
+        assert!(!doc.is_dirty());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
