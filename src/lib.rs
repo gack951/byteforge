@@ -18,6 +18,7 @@ use gpui::{
     UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
     rgb, rgba, size, uniform_list,
 };
+use gpui_component::tab::{Tab, TabBar};
 
 const BYTES_PER_ROW_OPTIONS: [usize; 4] = [8, 16, 24, 32];
 
@@ -232,6 +233,10 @@ impl ByteForge {
         }
     }
 
+    fn selected_ix_for(&self, side: PaneSide) -> usize {
+        self.active_ix_for(side).unwrap_or(self.active)
+    }
+
     fn scroll_handle_for(&self, side: PaneSide) -> UniformListScrollHandle {
         match side {
             PaneSide::Left => self.left_scroll_handle.clone(),
@@ -270,6 +275,26 @@ impl ByteForge {
         self.cursor = offset;
         self.pending_hex = None;
         self.scroll_to_cursor();
+        cx.notify();
+    }
+
+    fn select_format_field(&mut self, offset: u64, len: u64, cx: &mut Context<Self>) {
+        let Some(doc_len) = self.active_doc().map(ByteDocument::len) else {
+            return;
+        };
+        if doc_len == 0 || len == 0 || offset >= doc_len {
+            return;
+        }
+
+        let end = offset
+            .saturating_add(len)
+            .saturating_sub(1)
+            .min(doc_len - 1);
+        self.cursor = offset;
+        self.selection = Some(Selection::new(offset, end));
+        self.pending_hex = None;
+        self.scroll_to_cursor();
+        self.set_status(format!("Selected format field 0x{offset:X}..0x{end:X}."));
         cx.notify();
     }
 
@@ -841,9 +866,19 @@ impl ByteForge {
         Ok(count)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn activate_doc(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.activate_doc_for_pane(self.focused_pane, ix, cx);
+    }
+
+    fn activate_doc_for_pane(&mut self, side: PaneSide, ix: usize, cx: &mut Context<Self>) {
         if ix < self.docs.len() {
-            self.set_active_for_focused_pane(ix);
+            self.focus_pane(side);
+            if self.split && side == PaneSide::Right {
+                self.right_active = Some(ix);
+            } else {
+                self.active = ix;
+            }
             self.cursor = 0;
             self.selection = None;
             self.pending_hex = None;
@@ -857,101 +892,121 @@ impl ByteForge {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
             .gap_1()
-            .items_center()
             .px_2()
             .py_1()
             .bg(rgb(0x20242a))
             .border_b_1()
             .border_color(rgb(0x303741))
-            .child(self.toolbar_button(
-                "open",
-                "Open",
-                Some("Ctrl+O"),
-                cx.listener(|this, _, window, cx| this.open_files(&OpenFiles, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "save-as",
-                "Save As",
-                Some("Ctrl+S"),
-                cx.listener(|this, _, window, cx| this.save_as(&SaveAs, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "copy-hex",
-                "Copy Hex",
-                Some("Ctrl+C"),
-                cx.listener(|this, _, window, cx| this.copy_hex(&CopyHex, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "copy-text",
-                "Copy Text",
-                Some("Ctrl+Shift+C"),
-                cx.listener(|this, _, window, cx| this.copy_text(&CopyText, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "undo",
-                "Undo",
-                Some("Ctrl+Z"),
-                cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "redo",
-                "Redo",
-                Some("Ctrl+Y"),
-                cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "paste-hex",
-                "Paste Hex",
-                Some("Ctrl+V"),
-                cx.listener(|this, _, window, cx| this.paste_hex(&PasteHex, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "paste-text",
-                "Paste Text",
-                Some("Ctrl+Shift+V"),
-                cx.listener(|this, _, window, cx| this.paste_text(&PasteText, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "delete",
-                "Delete",
-                Some("Del"),
-                cx.listener(|this, _, window, cx| {
-                    this.delete_selection(&DeleteSelection, window, cx)
-                }),
-            ))
-            .child(self.toolbar_button(
-                "find-clip",
-                "Find",
-                Some("Ctrl+F"),
-                cx.listener(|this, _, window, cx| this.find_next(&FindNext, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "goto",
-                "Goto",
-                Some("Ctrl+G"),
-                cx.listener(|this, _, window, cx| this.goto(&Goto, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "compare",
-                "Compare",
-                Some("Ctrl+D"),
-                cx.listener(|this, _, window, cx| this.compare_next(&CompareNext, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "split",
-                "Split",
-                Some("Ctrl+\\"),
-                cx.listener(|this, _, window, cx| this.toggle_split(&ToggleSplit, window, cx)),
-            ))
-            .child(self.toolbar_button(
-                "move-pane",
-                "Move Pane",
-                Some("Ctrl+M"),
-                cx.listener(|this, _, window, cx| {
-                    this.move_to_other_split(&MoveToOtherSplit, window, cx)
-                }),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(self.toolbar_button(
+                        "open",
+                        "Open",
+                        Some("Ctrl+O"),
+                        cx.listener(|this, _, window, cx| this.open_files(&OpenFiles, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "save-as",
+                        "Save As",
+                        Some("Ctrl+S"),
+                        cx.listener(|this, _, window, cx| this.save_as(&SaveAs, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "copy-hex",
+                        "Copy Hex",
+                        Some("Ctrl+C"),
+                        cx.listener(|this, _, window, cx| this.copy_hex(&CopyHex, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "copy-text",
+                        "Copy Text",
+                        Some("Ctrl+Shift+C"),
+                        cx.listener(|this, _, window, cx| this.copy_text(&CopyText, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "undo",
+                        "Undo",
+                        Some("Ctrl+Z"),
+                        cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "redo",
+                        "Redo",
+                        Some("Ctrl+Y"),
+                        cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "paste-hex",
+                        "Paste Hex",
+                        Some("Ctrl+V"),
+                        cx.listener(|this, _, window, cx| this.paste_hex(&PasteHex, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "paste-text",
+                        "Paste Text",
+                        Some("Ctrl+Shift+V"),
+                        cx.listener(|this, _, window, cx| this.paste_text(&PasteText, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "delete",
+                        "Delete",
+                        Some("Del"),
+                        cx.listener(|this, _, window, cx| {
+                            this.delete_selection(&DeleteSelection, window, cx)
+                        }),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .child(self.toolbar_button(
+                        "find-clip",
+                        "Find",
+                        Some("Ctrl+F"),
+                        cx.listener(|this, _, window, cx| this.find_next(&FindNext, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "goto",
+                        "Goto",
+                        Some("Ctrl+G"),
+                        cx.listener(|this, _, window, cx| this.goto(&Goto, window, cx)),
+                    ))
+                    .child(self.toolbar_button(
+                        "compare",
+                        "Compare",
+                        Some("Ctrl+D"),
+                        cx.listener(|this, _, window, cx| {
+                            this.compare_next(&CompareNext, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "split",
+                        "Split",
+                        Some("Ctrl+\\"),
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_split(&ToggleSplit, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "move-pane",
+                        "Move Pane",
+                        Some("Ctrl+M"),
+                        cx.listener(|this, _, window, cx| {
+                            this.move_to_other_split(&MoveToOtherSplit, window, cx)
+                        }),
+                    )),
+            )
     }
 
     fn toolbar_button(
@@ -993,45 +1048,37 @@ impl ByteForge {
             .into_any_element()
     }
 
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tabs(&self, side: PaneSide, cx: &mut Context<Self>) -> AnyElement {
         if self.docs.is_empty() {
             return div()
                 .px_3()
                 .py_2()
                 .bg(rgb(0x15181d))
                 .text_color(rgb(0x8792a2))
-                .child("No file open");
+                .child("No file open")
+                .into_any_element();
         }
 
-        div()
-            .flex()
-            .gap_1()
+        let selected_ix = self.selected_ix_for(side).min(self.docs.len() - 1);
+        TabBar::new(("file-tabs", pane_index(side)))
+            .outline()
+            .selected_index(selected_ix)
+            .on_click(cx.listener(move |this, ix: &usize, _, cx| {
+                this.activate_doc_for_pane(side, *ix, cx);
+            }))
+            .children(self.docs.iter().enumerate().map(|(ix, doc)| {
+                let label = format!("{}{}", doc.name(), if doc.is_dirty() { "*" } else { "" });
+                let side_label = side.label().to_ascii_lowercase();
+                Tab::new()
+                    .label(label)
+                    .debug_selector(move || format!("tab-{side_label}-{ix}"))
+            }))
+            .bg(rgb(0x15181d))
             .px_2()
             .py_1()
-            .bg(rgb(0x15181d))
-            .children(self.docs.iter().enumerate().map(|(ix, doc)| {
-                let mut tab = div()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .text_sm()
-                    .cursor_pointer()
-                    .child(format!(
-                        "{}{}",
-                        doc.name(),
-                        if doc.is_dirty() { "*" } else { "" }
-                    ))
-                    .id(("tab", ix))
-                    .on_click(cx.listener(move |this, _, _, cx| this.activate_doc(ix, cx)));
-                tab = if ix == self.active {
-                    tab.bg(rgb(0x2c3643)).text_color(rgb(0xffffff))
-                } else if Some(ix) == self.compare_with {
-                    tab.bg(rgb(0x443827)).text_color(rgb(0xffd89c))
-                } else {
-                    tab.bg(rgb(0x20242a)).text_color(rgb(0xb8c1cf))
-                };
-                tab
-            }))
+            .border_b_1()
+            .border_color(rgb(0x303741))
+            .into_any_element()
     }
 
     fn render_hex_view(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1039,6 +1086,8 @@ impl ByteForge {
             div()
                 .flex()
                 .flex_1()
+                .w_full()
+                .min_w(px(0.0))
                 .child(self.render_hex_pane(PaneSide::Left, cx))
                 .child(div().w(px(1.0)).h_full().bg(rgb(0x303741)))
                 .child(self.render_hex_pane(PaneSide::Right, cx))
@@ -1046,6 +1095,8 @@ impl ByteForge {
             div()
                 .flex()
                 .flex_1()
+                .w_full()
+                .min_w(px(0.0))
                 .child(self.render_hex_pane(PaneSide::Left, cx))
         }
     }
@@ -1075,8 +1126,10 @@ impl ByteForge {
         div()
             .id(("hex-pane", pane_index(side)))
             .flex_1()
+            .min_w(px(0.0))
             .flex()
             .flex_col()
+            .min_h(px(0.0))
             .bg(rgb(0x101318))
             .border_1()
             .border_color(focus_color)
@@ -1084,6 +1137,7 @@ impl ByteForge {
                 this.focus_pane(side);
                 cx.notify();
             }))
+            .child(self.render_tabs(side, cx))
             .child(
                 div()
                     .flex()
@@ -1107,22 +1161,52 @@ impl ByteForge {
                     }),
             )
             .child(
-                div().flex_1().child(
-                    uniform_list(
-                        ("hex-rows", pane_index(side)),
-                        row_count,
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            let mut rows = Vec::with_capacity(range.end - range.start);
-                            for row in range {
-                                rows.push(this.render_hex_row(doc_ix, side, row, cx));
-                            }
-                            rows
-                        }),
+                div()
+                    .id(("hex-scroll", pane_index(side)))
+                    .debug_selector(move || {
+                        format!("hex-scroll-{}", side.label().to_ascii_lowercase())
+                    })
+                    .flex()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .min_h(px(0.0))
+                    .overflow_x_scroll()
+                    .child(
+                        div().flex_1().min_w(px(0.0)).child(
+                            uniform_list(
+                                ("hex-rows", pane_index(side)),
+                                row_count,
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let mut rows = Vec::with_capacity(range.end - range.start);
+                                    for row in range {
+                                        rows.push(this.render_hex_row(doc_ix, side, row, cx));
+                                    }
+                                    rows
+                                }),
+                            )
+                            .track_scroll(self.scroll_handle_for(side))
+                            .h_full(),
+                        ),
                     )
-                    .track_scroll(self.scroll_handle_for(side))
-                    .h_full(),
-                ),
+                    .child(self.render_hex_scrollbar(doc_ix, side)),
             )
+            .into_any_element()
+    }
+
+    fn render_hex_scrollbar(&self, _doc_ix: usize, side: PaneSide) -> AnyElement {
+        div()
+            .debug_selector(move || format!("hex-scrollbar-{}", side.label().to_ascii_lowercase()))
+            .w(px(10.0))
+            .h_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .bg(rgb(0x171b21))
+            .border_l_1()
+            .border_color(rgb(0x303741))
+            .child(div().flex_grow())
+            .child(div().w(px(6.0)).h(px(44.0)).rounded_sm().bg(rgb(0x5d6878)))
+            .child(div().flex_grow())
             .into_any_element()
     }
 
@@ -1179,6 +1263,8 @@ impl ByteForge {
 
         div()
             .flex()
+            .flex_shrink_0()
+            .w_full()
             .items_center()
             .h(px(28.0))
             .px_2()
@@ -1352,7 +1438,7 @@ impl ByteForge {
             .is_none_or(|right| right != left)
     }
 
-    fn render_inspector(&self) -> impl IntoElement {
+    fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let format_summary = self
             .active_doc()
             .and_then(|doc| detect_format_fields(doc, 96));
@@ -1374,7 +1460,9 @@ impl ByteForge {
         div()
             .id("inspector")
             .w(px(300.0))
+            .flex_shrink_0()
             .h_full()
+            .min_h(px(0.0))
             .bg(rgb(0x15181d))
             .border_l_1()
             .border_color(rgb(0x303741))
@@ -1422,7 +1510,7 @@ impl ByteForge {
                 ),
             )
             .child(div().h(px(1.0)).bg(rgb(0x303741)).my_2())
-            .child(self.render_format_section(format_summary))
+            .child(self.render_format_section(format_summary, cx))
             .child(div().h(px(1.0)).bg(rgb(0x303741)).my_2())
             .children(
                 values
@@ -1444,7 +1532,11 @@ impl ByteForge {
             .child(div().text_align(gpui::TextAlign::Right).child(value.into()))
     }
 
-    fn render_format_section(&self, summary: Option<FormatSummary>) -> AnyElement {
+    fn render_format_section(
+        &self,
+        summary: Option<FormatSummary>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(summary) = summary else {
             return self.meta_line("Format", "unknown").into_any_element();
         };
@@ -1458,15 +1550,19 @@ impl ByteForge {
                 summary
                     .fields
                     .into_iter()
-                    .map(|field| self.render_format_field(field)),
+                    .map(|field| self.render_format_field(field, cx)),
             )
             .into_any_element()
     }
 
-    fn render_format_field(&self, field: FormatField) -> AnyElement {
+    fn render_format_field(&self, field: FormatField, cx: &mut Context<Self>) -> AnyElement {
         let active = field.contains(self.cursor);
         let background = if active { 0x26313d } else { 0x1b1f26 };
+        let offset = field.offset;
+        let len = field.len;
         div()
+            .id(("format-field", offset))
+            .debug_selector(move || format!("format-field-{offset}"))
             .flex()
             .flex_col()
             .gap_1()
@@ -1502,14 +1598,39 @@ impl ByteForge {
                     .text_color(rgb(0xaeb8c6))
                     .child(field.meaning),
             )
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.select_format_field(offset, len, cx);
+            }))
             .into_any_element()
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let message = if self.goto_open {
-            format!("Goto > {}", self.goto_input)
+        let status_content = if self.goto_open {
+            div()
+                .debug_selector(|| "goto-input".to_string())
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_color(rgb(0x8792a2)).child("Goto"))
+                .child(
+                    div()
+                        .min_w(px(160.0))
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x101318))
+                        .border_1()
+                        .border_color(rgb(0x5a87c7))
+                        .text_color(rgb(0xe9eef5))
+                        .child(self.goto_input.clone()),
+                )
+                .into_any_element()
         } else {
-            self.status.to_string()
+            div()
+                .debug_selector(|| "status-message".to_string())
+                .child(self.status.clone())
+                .into_any_element()
         };
         let endian_label = match self.endian {
             Endianness::Little => "Little",
@@ -1517,8 +1638,10 @@ impl ByteForge {
         };
         div()
             .flex()
+            .flex_shrink_0()
             .items_center()
             .justify_between()
+            .flex_wrap()
             .gap_2()
             .px_2()
             .py_1()
@@ -1527,10 +1650,12 @@ impl ByteForge {
             .border_color(rgb(0x303741))
             .text_color(rgb(0xb8c1cf))
             .text_sm()
-            .child(div().child(message))
+            .child(div().flex_1().min_w(px(180.0)).child(status_content))
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .justify_end()
                     .items_center()
                     .gap_1()
                     .child(self.toolbar_button(
@@ -1595,6 +1720,7 @@ impl Render for ByteForge {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .overflow_hidden()
             .track_focus(&self.focus_handle(cx))
             .key_context("ByteForge")
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -1633,13 +1759,15 @@ impl Render for ByteForge {
             .flex()
             .flex_col()
             .child(self.render_toolbar(cx))
-            .child(self.render_tabs(cx))
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .w_full()
+                    .min_h(px(0.0))
+                    .min_w(px(0.0))
                     .child(self.render_hex_view(cx))
-                    .child(self.render_inspector()),
+                    .child(self.render_inspector(cx)),
             )
             .child(self.render_status(cx))
     }
@@ -1654,6 +1782,7 @@ mod tests {
     };
 
     fn bind_test_keys(cx: &mut App) {
+        gpui_component::init(cx);
         cx.bind_keys([
             KeyBinding::new("secondary-o", OpenFiles, None),
             KeyBinding::new("secondary-s", SaveAs, None),
@@ -1717,13 +1846,42 @@ mod tests {
     }
 
     fn draw_visual_app(cx: &mut VisualTestContext, view: &Entity<ByteForge>) {
+        draw_visual_app_at(cx, view, 1600.0, 900.0);
+    }
+
+    fn draw_visual_app_at(
+        cx: &mut VisualTestContext,
+        view: &Entity<ByteForge>,
+        width: f32,
+        height: f32,
+    ) {
+        cx.simulate_resize(size(px(width), px(height)));
         cx.draw(
             point(px(0.0), px(0.0)),
             size(
-                AvailableSpace::Definite(px(1600.0)),
-                AvailableSpace::Definite(px(900.0)),
+                AvailableSpace::Definite(px(width)),
+                AvailableSpace::Definite(px(height)),
             ),
             |_, _| view.clone(),
+        );
+    }
+
+    fn assert_visible(cx: &mut VisualTestContext, selector: &'static str, width: f32, height: f32) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing bounds for {selector}"));
+        assert!(
+            bounds.origin.x >= px(0.0)
+                && bounds.origin.y >= px(0.0)
+                && bounds.origin.x + bounds.size.width <= px(width)
+                && bounds.origin.y + bounds.size.height <= px(height),
+            "{selector} is outside viewport: {:?}",
+            bounds
+        );
+        assert!(
+            bounds.size.width > gpui::Pixels::ZERO && bounds.size.height > gpui::Pixels::ZERO,
+            "{selector} has no visible size: {:?}",
+            bounds
         );
     }
 
@@ -1732,6 +1890,21 @@ mod tests {
             .debug_bounds(selector)
             .unwrap_or_else(|| panic!("missing button bounds for {selector}"));
         cx.simulate_click(bounds.center(), Modifiers::default());
+    }
+
+    fn sample_png_document() -> ByteDocument {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x89PNG\r\n\x1A\n");
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&64u32.to_be_bytes());
+        bytes.extend_from_slice(&32u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        ByteDocument::from_bytes("sample.png", bytes)
     }
 
     #[gpui::test]
@@ -1750,6 +1923,7 @@ mod tests {
 
     #[gpui::test]
     fn hex_view_draws_rows_and_tracks_scroll_size(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
         let bytes = (0..4096).map(|ix| (ix % 251) as u8).collect();
         let (view, cx) = cx.add_window_view(|_, cx| {
             ByteForge::with_documents(vec![ByteDocument::from_bytes("visible.bin", bytes)], cx)
@@ -1777,6 +1951,65 @@ mod tests {
                 item_size.contents.height > item_size.item.height,
                 "large document should produce scrollable list content"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn visible_controls_tabs_scroll_and_goto_input(cx: &mut TestAppContext) {
+        cx.update(bind_test_keys);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = ByteForge::with_documents(
+                vec![
+                    sample_png_document(),
+                    ByteDocument::from_bytes("other.bin", b"abcdef".to_vec()),
+                ],
+                cx,
+            );
+            view.split = true;
+            view.right_active = Some(1);
+            view.focused_pane = PaneSide::Left;
+            view
+        });
+
+        let width = 1280.0;
+        let height = 820.0;
+        draw_visual_app_at(cx, &view, width, height);
+        for selector in [
+            "button-goto",
+            "button-edit-mode",
+            "button-endian",
+            "button-encoding",
+            "hex-scroll-left",
+            "hex-scroll-right",
+            "hex-scrollbar-left",
+            "hex-scrollbar-right",
+            "tab-left-0",
+            "tab-right-1",
+            "format-field-0",
+        ] {
+            assert_visible(cx, selector, width, height);
+        }
+
+        click_button(cx, "button-goto");
+        draw_visual_app_at(cx, &view, width, height);
+        assert_visible(cx, "goto-input", width, height);
+        view.update(cx, |view, _| assert!(view.goto_open));
+    }
+
+    #[gpui::test]
+    fn clicking_format_field_selects_hex_range(cx: &mut TestAppContext) {
+        cx.update(bind_test_keys);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| ByteForge::with_documents(vec![sample_png_document()], cx));
+
+        draw_visual_app(cx, &view);
+        assert_visible(cx, "format-field-0", 1600.0, 900.0);
+        click_button(cx, "format-field-0");
+
+        view.update(cx, |view, _| {
+            assert_eq!(view.cursor, 0);
+            assert_eq!(view.selection_range(), Some(0..8));
+            assert_eq!(view.status.as_ref(), "Selected format field 0x0..0x7.");
         });
     }
 

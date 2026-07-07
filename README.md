@@ -8,8 +8,9 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 
 - Multi-file workspace with tab switching.
 - Open one or more files from the toolbar/menu or by dragging files onto the window.
-- Left/right split view with independent file assignment and pane focus.
+- Left/right split view with independent file tabs, active tab state, file assignment, and pane focus.
 - Virtualized hex view using GPUI `uniform_list`; only visible rows are rendered.
+- Always-visible hex viewport scrollbar rail.
 - Memory-mapped original file content through `memmap2`.
 - Piece-table editing model for insert, overwrite, replacement, and arbitrary range deletion.
 - Insert and overwrite modes.
@@ -19,7 +20,7 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 - Direct hex nibble input in the hex view.
 - Hex and text clipboard formats.
 - Save As that streams the current piece table to disk.
-- Inspector panel with offset, integer widths, floats, endian mode, text preview, and read-only file-format fields for PNG, BMP, WAV, GIF, JPEG, and ZIP.
+- Inspector panel with offset, integer widths, floats, endian mode, text preview, and clickable read-only file-format fields for PNG, BMP, WAV, GIF, JPEG, and ZIP.
 - Preview encoding toggle: UTF-8, UTF-16LE, UTF-16BE, Shift-JIS, ASCII.
 - Same-offset multi-file comparison highlighting.
 - Clipboard search: parses hex first, then falls back to literal text bytes, and scrolls to hits.
@@ -107,7 +108,7 @@ The test suite includes:
 - Hex parser and virtual-document search.
 - File-format detection for PNG, BMP, WAV, GIF, JPEG, and ZIP, including edited document bytes.
 - 32 MiB large-document viewport/edit/search performance guard.
-- GPUI headless tests for keyboard navigation, selection, Shift+click/drag selection state, direct hex input, copy/cut/paste/delete, undo/redo, find auto-scroll, Goto, split panes, EOF append cursor behavior, compare, mode toggles, tab activation, open-path, save-path, and 4 MiB document rendering.
+- GPUI headless tests for keyboard navigation, selection, Shift+click/drag selection state, direct hex input, copy/cut/paste/delete, undo/redo, find auto-scroll, Goto, split panes, visible controls/tabs/scrollbars, format-field range selection, EOF append cursor behavior, compare, mode toggles, tab activation, open-path, save-path, and 4 MiB document rendering.
 
 ## Roadmap
 
