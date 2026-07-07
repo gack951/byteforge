@@ -18,7 +18,10 @@ use gpui::{
     UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
     rgb, rgba, size, uniform_list,
 };
-use gpui_component::tab::{Tab, TabBar};
+use gpui_component::{
+    scroll::ScrollableElement,
+    tab::{Tab, TabBar},
+};
 
 const BYTES_PER_ROW_OPTIONS: [usize; 4] = [8, 16, 24, 32];
 
@@ -38,6 +41,9 @@ actions!(
         DeleteSelection,
         SelectAll,
         FindNext,
+        ToggleReplace,
+        ReplaceNext,
+        ReplaceAll,
         CompareNext,
         Goto,
         ToggleSplit,
@@ -95,6 +101,13 @@ impl PaneSide {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextField {
+    Goto,
+    Find,
+    Replace,
+}
+
 struct ByteForge {
     docs: Vec<ByteDocument>,
     active: usize,
@@ -112,6 +125,11 @@ struct ByteForge {
     drag_anchor: Option<u64>,
     goto_open: bool,
     goto_input: String,
+    replace_open: bool,
+    find_input: String,
+    replace_input: String,
+    active_text_field: Option<TextField>,
+    text_selection: Option<Range<usize>>,
     left_scroll_handle: UniformListScrollHandle,
     right_scroll_handle: UniformListScrollHandle,
     #[cfg(test)]
@@ -149,6 +167,11 @@ impl ByteForge {
             drag_anchor: None,
             goto_open: false,
             goto_input: String::new(),
+            replace_open: false,
+            find_input: String::new(),
+            replace_input: String::new(),
+            active_text_field: None,
+            text_selection: None,
             left_scroll_handle: UniformListScrollHandle::new(),
             right_scroll_handle: UniformListScrollHandle::new(),
             #[cfg(test)]
@@ -179,6 +202,11 @@ impl ByteForge {
             drag_anchor: None,
             goto_open: false,
             goto_input: String::new(),
+            replace_open: false,
+            find_input: String::new(),
+            replace_input: String::new(),
+            active_text_field: None,
+            text_selection: None,
             left_scroll_handle: UniformListScrollHandle::new(),
             right_scroll_handle: UniformListScrollHandle::new(),
             #[cfg(test)]
@@ -192,6 +220,22 @@ impl ByteForge {
 
     fn bytes_per_row(&self) -> usize {
         BYTES_PER_ROW_OPTIONS[self.bytes_per_row_ix]
+    }
+
+    fn text_value(&self, field: TextField) -> &str {
+        match field {
+            TextField::Goto => &self.goto_input,
+            TextField::Find => &self.find_input,
+            TextField::Replace => &self.replace_input,
+        }
+    }
+
+    fn text_value_mut(&mut self, field: TextField) -> &mut String {
+        match field {
+            TextField::Goto => &mut self.goto_input,
+            TextField::Find => &mut self.find_input,
+            TextField::Replace => &mut self.replace_input,
+        }
     }
 
     fn active_doc(&self) -> Option<&ByteDocument> {
@@ -266,47 +310,6 @@ impl ByteForge {
             })
             .unwrap_or(1)
             .max(1)
-    }
-
-    fn scroll_page_for(
-        &mut self,
-        side: PaneSide,
-        doc_ix: usize,
-        direction: i64,
-        cx: &mut Context<Self>,
-    ) {
-        let row_count = self.row_count_for(doc_ix);
-        let handle = self.scroll_handle_for(side);
-        let (current, visible_rows) = {
-            let state = handle.0.borrow();
-            let current = state
-                .deferred_scroll_to_item
-                .as_ref()
-                .map(|deferred| deferred.item_index)
-                .unwrap_or_else(|| state.base_handle.logical_scroll_top().0);
-            let visible_rows = state
-                .last_item_size
-                .map(|size| {
-                    let row_height = size.contents.height * (1.0 / row_count as f32);
-                    (size.item.height / row_height).floor().max(1.0) as usize
-                })
-                .unwrap_or(self.bytes_per_row());
-            (current.min(row_count - 1), visible_rows.max(1))
-        };
-
-        let target = if direction.is_negative() {
-            current.saturating_sub(visible_rows)
-        } else {
-            current.saturating_add(visible_rows).min(row_count - 1)
-        };
-        handle.scroll_to_item_strict(target, ScrollStrategy::Top);
-        self.focus_pane(side);
-        self.set_status(format!(
-            "{}ペインを {} 行目へスクロールしました。",
-            side.ja_label(),
-            target
-        ));
-        cx.notify();
     }
 
     fn clamp_cursor(&mut self) {
@@ -590,6 +593,13 @@ impl ByteForge {
     }
 
     fn paste_hex(&mut self, _: &PasteHex, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = self.active_text_field {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.replace_text_selection(field, &text);
+            }
+            cx.notify();
+            return;
+        }
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             self.set_status("クリップボードにテキストがありません。");
             cx.notify();
@@ -646,6 +656,11 @@ impl ByteForge {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(field) = self.active_text_field {
+            self.text_selection = Some(0..self.text_value(field).len());
+            cx.notify();
+            return;
+        }
         let Some(len) = self.active_doc().map(ByteDocument::len) else {
             return;
         };
@@ -658,18 +673,35 @@ impl ByteForge {
     }
 
     fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            self.set_status("検索するバイト列またはテキストを先にコピーしてください。");
-            cx.notify();
-            return;
+        let text = if self.replace_open {
+            self.find_input.clone()
+        } else {
+            let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                self.set_status("検索するバイト列またはテキストを先にコピーしてください。");
+                cx.notify();
+                return;
+            };
+            text
         };
 
         let needle = parse_hex_bytes(&text).unwrap_or_else(|_| text.into_bytes());
+        self.find_next_bytes(&needle, cx);
+    }
+
+    fn find_next_bytes(&mut self, needle: &[u8], cx: &mut Context<Self>) -> Option<u64> {
+        if needle.is_empty() {
+            self.set_status("検索する値が空です。");
+            cx.notify();
+            return None;
+        }
         let Some(doc) = self.active_doc() else {
-            return;
+            self.set_status("アクティブなファイルがありません。");
+            cx.notify();
+            return None;
         };
         let start = self.cursor.saturating_add(1).min(doc.len());
-        match find_bytes(doc, &needle, start).or_else(|| find_bytes(doc, &needle, 0)) {
+        let found = find_bytes(doc, needle, start).or_else(|| find_bytes(doc, needle, 0));
+        match found {
             Some(offset) => {
                 self.cursor = offset;
                 self.selection = Some(Selection::new(offset, offset + needle.len() as u64 - 1));
@@ -681,6 +713,132 @@ impl ByteForge {
             }
             None => self.set_status("一致するパターンは見つかりませんでした。"),
         }
+        cx.notify();
+        found
+    }
+
+    fn search_bytes_from_input(&self, cx: &App) -> Vec<u8> {
+        let _ = cx;
+        parse_hex_bytes(&self.find_input).unwrap_or_else(|_| self.find_input.clone().into_bytes())
+    }
+
+    fn replacement_bytes_from_input(&self, cx: &App) -> Vec<u8> {
+        let _ = cx;
+        parse_hex_bytes(&self.replace_input)
+            .unwrap_or_else(|_| self.replace_input.clone().into_bytes())
+    }
+
+    fn toggle_replace(&mut self, _: &ToggleReplace, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
+        self.replace_open = !self.replace_open;
+        self.goto_open = false;
+        self.active_text_field = self.replace_open.then_some(TextField::Find);
+        self.text_selection = None;
+        if self.replace_open {
+            self.set_status("置換パネルを開きました。");
+        } else {
+            self.set_status("置換パネルを閉じました。");
+        }
+        cx.notify();
+    }
+
+    fn replace_next(&mut self, _: &ReplaceNext, _: &mut Window, cx: &mut Context<Self>) {
+        let needle = self.search_bytes_from_input(cx);
+        if needle.is_empty() {
+            self.set_status("置換する検索値が空です。");
+            cx.notify();
+            return;
+        }
+        let replacement = self.replacement_bytes_from_input(cx);
+        let selected_matches = self.selection_range().is_some_and(|range| {
+            range.end - range.start == needle.len() as u64
+                && self
+                    .active_doc()
+                    .map(|doc| doc.read_range(range.start, needle.len()) == needle)
+                    .unwrap_or(false)
+        });
+
+        if selected_matches {
+            let range = self.selection_range().expect("checked above");
+            let next_start = range.start + replacement.len() as u64;
+            match self
+                .active_doc_mut()
+                .map(|doc| doc.replace_range(range.clone(), replacement))
+            {
+                Some(Ok(())) => {
+                    self.cursor =
+                        next_start.min(self.active_doc().map(ByteDocument::len).unwrap_or(0));
+                    self.selection = None;
+                    let found = self.find_next_bytes_from(self.cursor, &needle, cx);
+                    if found.is_none() {
+                        self.set_status("1件置換しました。次の一致はありません。");
+                        cx.notify();
+                    }
+                }
+                Some(Err(err)) => self.set_status(format!("置換に失敗しました: {err:#}")),
+                None => self.set_status("アクティブなファイルがありません。"),
+            }
+        } else {
+            self.find_next_bytes(&needle, cx);
+        }
+        cx.notify();
+    }
+
+    fn find_next_bytes_from(
+        &mut self,
+        start: u64,
+        needle: &[u8],
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let Some(doc) = self.active_doc() else {
+            return None;
+        };
+        let found = find_bytes(doc, needle, start).or_else(|| find_bytes(doc, needle, 0));
+        if let Some(offset) = found {
+            self.cursor = offset;
+            self.selection = Some(Selection::new(offset, offset + needle.len() as u64 - 1));
+            self.scroll_to_cursor();
+        }
+        cx.notify();
+        found
+    }
+
+    fn replace_all(&mut self, _: &ReplaceAll, _: &mut Window, cx: &mut Context<Self>) {
+        let needle = self.search_bytes_from_input(cx);
+        if needle.is_empty() {
+            self.set_status("置換する検索値が空です。");
+            cx.notify();
+            return;
+        }
+        let replacement = self.replacement_bytes_from_input(cx);
+        let mut offset = 0;
+        let mut count = 0usize;
+        loop {
+            let Some(found) = self
+                .active_doc()
+                .and_then(|doc| find_bytes(doc, &needle, offset))
+            else {
+                break;
+            };
+            match self.active_doc_mut().map(|doc| {
+                doc.replace_range(found..found + needle.len() as u64, replacement.clone())
+            }) {
+                Some(Ok(())) => {
+                    count += 1;
+                    offset = found + replacement.len() as u64;
+                }
+                Some(Err(err)) => {
+                    self.set_status(format!("一括置換に失敗しました: {err:#}"));
+                    cx.notify();
+                    return;
+                }
+                None => break,
+            }
+        }
+        self.cursor = offset.min(self.active_doc().map(ByteDocument::len).unwrap_or(0));
+        self.selection = None;
+        self.scroll_to_cursor();
+        self.set_status(format!("{count} 件を置換しました。"));
         cx.notify();
     }
 
@@ -734,9 +892,12 @@ impl ByteForge {
         cx.notify();
     }
 
-    fn goto(&mut self, _: &Goto, _: &mut Window, cx: &mut Context<Self>) {
+    fn goto(&mut self, _: &Goto, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = window;
         self.goto_open = true;
         self.goto_input = format!("0x{:X}", self.cursor);
+        self.active_text_field = Some(TextField::Goto);
+        self.text_selection = Some(2..self.goto_input.len());
         self.pending_hex = None;
         self.set_status("Goto: オフセットを入力し、Enterで移動、Escでキャンセルします。");
         cx.notify();
@@ -844,8 +1005,8 @@ impl ByteForge {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.goto_open {
-            self.handle_goto_key(event, cx);
+        if self.active_text_field.is_some() {
+            self.handle_text_input_key(event, window, cx);
             return;
         }
 
@@ -871,34 +1032,90 @@ impl ByteForge {
         }
     }
 
-    fn handle_goto_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        match event.keystroke.key.as_str() {
+    fn replace_text_selection(&mut self, field: TextField, text: &str) {
+        let selection = self.text_selection.take();
+        let value = self.text_value_mut(field);
+        if let Some(range) = selection {
+            let start = range.start.min(value.len());
+            let end = range.end.min(value.len()).max(start);
+            value.replace_range(start..end, text);
+        } else {
+            value.push_str(text);
+        }
+    }
+
+    fn delete_text_selection(&mut self, field: TextField, selection: Range<usize>) {
+        let value = self.text_value_mut(field);
+        let start = selection.start.min(value.len());
+        let end = selection.end.min(value.len()).max(start);
+        value.replace_range(start..end, "");
+    }
+
+    fn handle_text_input_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(field) = self.active_text_field else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            match key {
+                "a" => {
+                    self.text_selection = Some(0..self.text_value(field).len());
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "v" => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        self.replace_text_selection(field, &text);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
             "enter" => {
-                self.confirm_goto(cx);
+                if field == TextField::Goto {
+                    self.confirm_goto_from_input(cx);
+                } else {
+                    self.replace_next(&ReplaceNext, window, cx);
+                }
                 cx.stop_propagation();
             }
             "escape" => {
-                self.goto_open = false;
-                self.set_status("Gotoをキャンセルしました。");
+                if field == TextField::Goto {
+                    self.goto_open = false;
+                    self.active_text_field = None;
+                    self.set_status("Gotoをキャンセルしました。");
+                } else {
+                    self.active_text_field = None;
+                }
+                self.text_selection = None;
                 cx.notify();
                 cx.stop_propagation();
             }
             "backspace" => {
-                self.goto_input.pop();
+                if let Some(selection) = self.text_selection.take() {
+                    self.delete_text_selection(field, selection);
+                } else {
+                    self.text_value_mut(field).pop();
+                }
                 cx.notify();
                 cx.stop_propagation();
             }
             _ => {
-                let Some(key_char) = event.keystroke.key_char.as_deref() else {
-                    return;
-                };
-                for ch in key_char.chars() {
-                    if ch.is_ascii_hexdigit() || ch == 'x' || ch == 'X' {
-                        self.goto_input.push(ch);
-                    }
+                if let Some(key_char) = event.keystroke.key_char.as_deref() {
+                    self.replace_text_selection(field, key_char);
+                    cx.notify();
+                    cx.stop_propagation();
                 }
-                cx.notify();
-                cx.stop_propagation();
             }
         }
     }
@@ -913,10 +1130,16 @@ impl ByteForge {
         self.cursor = target.min(len);
         self.selection = None;
         self.goto_open = false;
+        self.active_text_field = None;
+        self.text_selection = None;
         self.pending_hex = None;
         self.scroll_to_cursor();
         self.set_status(format!("0x{:X} へ移動しました。", self.cursor));
         cx.notify();
+    }
+
+    fn confirm_goto_from_input(&mut self, cx: &mut Context<Self>) {
+        self.confirm_goto(cx);
     }
 
     fn input_hex_nibble(&mut self, nibble: u8, cx: &mut Context<Self>) {
@@ -1082,6 +1305,30 @@ impl ByteForge {
                         cx.listener(|this, _, window, cx| this.find_next(&FindNext, window, cx)),
                     ))
                     .child(self.toolbar_button(
+                        "replace",
+                        "Replace",
+                        Some("Ctrl+H"),
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_replace(&ToggleReplace, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "replace-next",
+                        "Replace 1",
+                        None,
+                        cx.listener(|this, _, window, cx| {
+                            this.replace_next(&ReplaceNext, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
+                        "replace-all",
+                        "Replace All",
+                        None,
+                        cx.listener(|this, _, window, cx| {
+                            this.replace_all(&ReplaceAll, window, cx)
+                        }),
+                    ))
+                    .child(self.toolbar_button(
                         "goto",
                         "Goto",
                         Some("Ctrl+G"),
@@ -1242,6 +1489,7 @@ impl ByteForge {
                 cx.notify();
             }))
             .child(self.render_tabs(side, cx))
+            .child(self.render_hex_header(cx))
             .child(
                 div()
                     .id(("hex-scroll", pane_index(side)))
@@ -1250,6 +1498,7 @@ impl ByteForge {
                     })
                     .flex()
                     .flex_1()
+                    .relative()
                     .min_w(px(0.0))
                     .min_h(px(0.0))
                     .overflow_x_scroll()
@@ -1270,122 +1519,58 @@ impl ByteForge {
                             .h_full(),
                         ),
                     )
-                    .child(self.render_hex_scrollbar(doc_ix, side, cx)),
+                    .vertical_scrollbar(&self.scroll_handle_for(side)),
             )
             .into_any_element()
     }
 
-    fn render_hex_scrollbar(
-        &self,
-        doc_ix: usize,
-        side: PaneSide,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let row_count = self.row_count_for(doc_ix);
-        let handle = self.scroll_handle_for(side);
-        let (top_spacer, thumb_height, bottom_spacer) = {
-            let state = handle.0.borrow();
-            if let Some(size) = state.last_item_size {
-                let track = size.item.height;
-                let content = if size.contents.height > track {
-                    size.contents.height
-                } else {
-                    track
-                };
-                let row_height = content * (1.0 / row_count as f32);
-                let current_top = state
-                    .deferred_scroll_to_item
-                    .as_ref()
-                    .map(|deferred| row_height * deferred.item_index)
-                    .unwrap_or_else(|| {
-                        let (ix, offset) = state.base_handle.logical_scroll_top();
-                        row_height * ix + offset
-                    });
-                let mut max_scroll = content - track;
-                if max_scroll < px(1.0) {
-                    max_scroll = px(1.0);
-                }
-                let ratio = (current_top / max_scroll).clamp(0.0, 1.0);
-                let mut thumb = track * (track / content);
-                if thumb < px(32.0) {
-                    thumb = px(32.0);
-                }
-                if thumb > track {
-                    thumb = track;
-                }
-                let top = (track - thumb) * ratio;
-                let mut bottom = track - thumb - top;
-                if bottom < px(0.0) {
-                    bottom = px(0.0);
-                }
-                (top, thumb, bottom)
-            } else {
-                (px(0.0), px(44.0), px(0.0))
-            }
-        };
+    fn selection_anchor_offset(&self) -> Option<u64> {
+        self.selection_range()
+            .map(|range| range.start)
+            .or_else(|| self.active_doc().map(|doc| self.cursor.min(doc.len())))
+    }
+
+    fn render_hex_header(&self, _cx: &mut Context<Self>) -> AnyElement {
+        let bytes_per_row = self.bytes_per_row();
+        let anchor_col = self
+            .selection_anchor_offset()
+            .map(|offset| (offset as usize) % bytes_per_row);
+        let byte_headers = (0..bytes_per_row).map(|ix| {
+            let active = anchor_col == Some(ix);
+            div()
+                .debug_selector(move || format!("hex-col-header-{ix}"))
+                .w(px(28.0))
+                .h(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(if active { rgb(0xd7a94a) } else { rgb(0x15181d) })
+                .text_color(if active { rgb(0x101318) } else { rgb(0x8792a2) })
+                .child(format!("{ix:02X}"))
+        });
 
         div()
-            .id(("hex-scrollbar", pane_index(side)))
-            .debug_selector(move || format!("hex-scrollbar-{}", side.label().to_ascii_lowercase()))
-            .w(px(10.0))
-            .flex_shrink_0()
-            .h_full()
+            .debug_selector(|| "hex-column-header".to_string())
             .flex()
-            .flex_col()
+            .flex_shrink_0()
+            .w_full()
             .items_center()
-            .bg(rgb(0x171b21))
-            .border_l_1()
-            .border_color(rgb(0x303741))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                    this.scroll_page_for(side, doc_ix, 1, cx);
-                    cx.stop_propagation();
-                }),
-            )
+            .h(px(26.0))
+            .px_2()
+            .bg(rgb(0x11161c))
+            .border_b_1()
+            .border_color(rgb(0x252c35))
+            .text_xs()
+            .font_family("Consolas, ui-monospace, SFMono-Regular, monospace")
             .child(
                 div()
-                    .id(("hex-scrollbar-top", pane_index(side)))
-                    .w_full()
-                    .h(top_spacer)
-                    .bg(rgb(0x171b21))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.scroll_page_for(side, doc_ix, -1, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(div().w_full().h_full().text_color(rgb(0x171b21)).child(".")),
+                    .w(px(132.0))
+                    .text_color(rgb(0x768497))
+                    .child("Address"),
             )
-            .child(
-                div()
-                    .w(px(6.0))
-                    .h(thumb_height)
-                    .rounded_sm()
-                    .bg(rgb(0x5d6878)),
-            )
-            .child(
-                div()
-                    .id(("hex-scrollbar-bottom", pane_index(side)))
-                    .debug_selector(move || {
-                        format!("hex-scrollbar-bottom-{}", side.label().to_ascii_lowercase())
-                    })
-                    .w_full()
-                    .h(bottom_spacer)
-                    .flex_1()
-                    .bg(rgb(0x171b21))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.scroll_page_for(side, doc_ix, 1, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(div().w_full().h_full().text_color(rgb(0x171b21)).child(".")),
-            )
+            .child(div().flex().gap_1().children(byte_headers))
+            .child(div().ml_4().text_color(rgb(0x768497)).child("ASCII"))
             .into_any_element()
     }
 
@@ -1440,6 +1625,11 @@ impl ByteForge {
             ascii_cells.push(self.render_ascii_cell(doc_ix, side, byte_offset, ch, cx));
         }
 
+        let anchor_row_start = self
+            .selection_anchor_offset()
+            .map(|anchor| (anchor / bytes_per_row as u64) * bytes_per_row as u64);
+        let address_active = anchor_row_start == Some(offset);
+
         div()
             .flex()
             .flex_shrink_0()
@@ -1453,7 +1643,18 @@ impl ByteForge {
             .child(
                 div()
                     .w(px(132.0))
-                    .text_color(rgb(0x768497))
+                    .rounded_sm()
+                    .px_1()
+                    .bg(if address_active {
+                        rgb(0xd7a94a)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .text_color(if address_active {
+                        rgb(0x101318)
+                    } else {
+                        rgb(0x768497)
+                    })
                     .child(format!("{offset:016X}")),
             )
             .child(div().flex().gap_1().children(byte_cells))
@@ -1784,26 +1985,116 @@ impl ByteForge {
             .into_any_element()
     }
 
+    fn render_text_box(
+        &self,
+        field: TextField,
+        selector: &'static str,
+        placeholder: &'static str,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let value = self.text_value(field);
+        let focused = self.active_text_field == Some(field);
+        let selection = focused.then(|| self.text_selection.clone()).flatten();
+        let content = if value.is_empty() {
+            div()
+                .text_color(rgb(0x697586))
+                .child(placeholder)
+                .into_any_element()
+        } else if let Some(range) = selection {
+            let start = range.start.min(value.len());
+            let end = range.end.min(value.len()).max(start);
+            div()
+                .flex()
+                .child(value[..start].to_string())
+                .child(
+                    div()
+                        .bg(rgb(0x2e6fb8))
+                        .text_color(rgb(0xffffff))
+                        .child(value[start..end].to_string()),
+                )
+                .child(value[end..].to_string())
+                .into_any_element()
+        } else {
+            div().child(value.to_string()).into_any_element()
+        };
+
+        div()
+            .debug_selector(move || selector.to_string())
+            .w(px(width))
+            .h(px(28.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_sm()
+            .bg(rgb(0x101318))
+            .border_1()
+            .border_color(if focused {
+                rgb(0x5a87c7)
+            } else {
+                rgb(0x303741)
+            })
+            .text_color(rgb(0xe9eef5))
+            .font_family("Consolas, ui-monospace, SFMono-Regular, monospace")
+            .cursor_text()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.active_text_field = Some(field);
+                    this.text_selection = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }),
+            )
+            .child(content)
+            .into_any_element()
+    }
+
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status_content = if self.goto_open {
             div()
-                .debug_selector(|| "goto-input".to_string())
+                .debug_selector(|| "goto-panel".to_string())
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(div().text_color(rgb(0x8792a2)).child("Goto"))
-                .child(
-                    div()
-                        .min_w(px(160.0))
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(rgb(0x101318))
-                        .border_1()
-                        .border_color(rgb(0x5a87c7))
-                        .text_color(rgb(0xe9eef5))
-                        .child(self.goto_input.clone()),
-                )
+                .child(self.render_text_box(TextField::Goto, "goto-input", "0x0", 180.0, cx))
+                .into_any_element()
+        } else if self.replace_open {
+            div()
+                .debug_selector(|| "replace-panel".to_string())
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .gap_2()
+                .child(div().text_color(rgb(0x8792a2)).child("検索"))
+                .child(self.render_text_box(
+                    TextField::Find,
+                    "replace-find-input",
+                    "検索",
+                    180.0,
+                    cx,
+                ))
+                .child(div().text_color(rgb(0x8792a2)).child("置換"))
+                .child(self.render_text_box(
+                    TextField::Replace,
+                    "replace-with-input",
+                    "置換",
+                    180.0,
+                    cx,
+                ))
+                .child(self.toolbar_button(
+                    "replace-panel-next",
+                    "Replace 1",
+                    None,
+                    cx.listener(|this, _, window, cx| this.replace_next(&ReplaceNext, window, cx)),
+                ))
+                .child(self.toolbar_button(
+                    "replace-panel-all",
+                    "Replace All",
+                    None,
+                    cx.listener(|this, _, window, cx| this.replace_all(&ReplaceAll, window, cx)),
+                ))
                 .into_any_element()
         } else {
             div()
@@ -1919,6 +2210,9 @@ impl Render for ByteForge {
             .on_action(cx.listener(Self::delete_selection))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::toggle_replace))
+            .on_action(cx.listener(Self::replace_next))
+            .on_action(cx.listener(Self::replace_all))
             .on_action(cx.listener(Self::compare_next))
             .on_action(cx.listener(Self::goto))
             .on_action(cx.listener(Self::toggle_split))
@@ -1977,6 +2271,7 @@ mod tests {
             KeyBinding::new("delete", DeleteSelection, None),
             KeyBinding::new("secondary-a", SelectAll, None),
             KeyBinding::new("secondary-f", FindNext, None),
+            KeyBinding::new("secondary-h", ToggleReplace, None),
             KeyBinding::new("secondary-g", Goto, None),
             KeyBinding::new("secondary-d", CompareNext, None),
             KeyBinding::new("secondary-\\", ToggleSplit, None),
@@ -2078,18 +2373,6 @@ mod tests {
         cx.simulate_click(bounds.center(), Modifiers::default());
     }
 
-    fn mouse_down_selector(cx: &mut VisualTestContext, selector: &'static str) {
-        let bounds = cx
-            .debug_bounds(selector)
-            .unwrap_or_else(|| panic!("missing bounds for {selector}"));
-        assert!(
-            bounds.size.width > gpui::Pixels::ZERO && bounds.size.height > gpui::Pixels::ZERO,
-            "{selector} has no clickable size: {:?}",
-            bounds
-        );
-        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
-    }
-
     fn sample_png_document() -> ByteDocument {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\x89PNG\r\n\x1A\n");
@@ -2179,8 +2462,8 @@ mod tests {
             "button-encoding",
             "hex-scroll-left",
             "hex-scroll-right",
-            "hex-scrollbar-left",
-            "hex-scrollbar-right",
+            "hex-column-header",
+            "hex-col-header-0",
             "tab-left-0",
             "tab-right-1",
             "format-field-0",
@@ -2195,7 +2478,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn visible_scrollbar_click_pages_hex_view(cx: &mut TestAppContext) {
+    fn visible_scrollbar_tracks_virtual_scroll(cx: &mut TestAppContext) {
         cx.update(bind_test_keys);
         let bytes = (0..4096).map(|ix| (ix % 251) as u8).collect();
         let (view, cx) = cx.add_window_view(|_, cx| {
@@ -2204,12 +2487,31 @@ mod tests {
 
         draw_visual_app_at(cx, &view, 1280.0, 820.0);
         draw_visual_app_at(cx, &view, 1280.0, 820.0);
-        mouse_down_selector(cx, "hex-scrollbar-bottom-left");
+        view.update(cx, |view, _| {
+            view.left_scroll_handle
+                .scroll_to_item(80, ScrollStrategy::Top);
+            assert_eq!(
+                view.left_scroll_handle
+                    .0
+                    .borrow()
+                    .deferred_scroll_to_item
+                    .as_ref()
+                    .map(|item| item.item_index),
+                Some(80)
+            );
+        });
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
         draw_visual_app_at(cx, &view, 1280.0, 820.0);
         view.update(cx, |view, _| {
-            assert!(view.status.contains("左ペインを "));
-            assert!(view.status.contains("行目へスクロールしました。"));
-            assert!(!view.status.contains(" 0 行目"));
+            assert!(
+                view.left_scroll_handle
+                    .0
+                    .borrow()
+                    .base_handle
+                    .max_offset()
+                    .height
+                    > px(0.0)
+            );
         });
     }
 
@@ -2877,6 +3179,7 @@ mod tests {
             .update(cx, |view, _, _| {
                 assert!(view.goto_open);
                 assert_eq!(view.goto_input, "0x0");
+                assert_eq!(view.text_selection, Some(2..3));
             })
             .unwrap();
 
@@ -2893,6 +3196,60 @@ mod tests {
             .update(cx, |view, _, _| {
                 assert!(view.goto_open);
                 assert_eq!(doc_bytes(view), b"abcdef");
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn goto_text_box_supports_select_all_and_paste(cx: &mut TestAppContext) {
+        let window = open_test_window(
+            cx,
+            vec![ByteDocument::from_bytes("sample.bin", vec![0; 512])],
+        );
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-g").unwrap());
+        window
+            .update(cx, |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string("0x80".to_string()));
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-a").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-v").unwrap());
+        cx.dispatch_keystroke(*window, Keystroke::parse("enter").unwrap());
+
+        window
+            .update(cx, |view, _, _| {
+                assert!(!view.goto_open);
+                assert_eq!(view.cursor, 0x80);
+                assert_eq!(doc_bytes(view).len(), 512);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn replace_next_and_replace_all_update_document(cx: &mut TestAppContext) {
+        let window = open_test_window(
+            cx,
+            vec![ByteDocument::from_bytes(
+                "sample.bin",
+                b"abc abc abc".to_vec(),
+            )],
+        );
+
+        window
+            .update(cx, |view, window, cx| {
+                view.toggle_replace(&ToggleReplace, window, cx);
+                view.find_input = "abc".to_string();
+                view.replace_input = "XY".to_string();
+                view.cursor = view.active_doc().unwrap().len();
+                view.find_next(&FindNext, window, cx);
+                assert_eq!(view.selection_range(), Some(0..3));
+                view.replace_next(&ReplaceNext, window, cx);
+                assert_eq!(doc_bytes(view), b"XY abc abc");
+                assert_eq!(view.selection_range(), Some(3..6));
+                view.replace_all(&ReplaceAll, window, cx);
+                assert_eq!(doc_bytes(view), b"XY XY XY");
+                assert_eq!(view.status.as_ref(), "2 件を置換しました。");
             })
             .unwrap();
     }
@@ -3105,6 +3462,7 @@ pub fn run_app() {
             KeyBinding::new("delete", DeleteSelection, None),
             KeyBinding::new("secondary-a", SelectAll, None),
             KeyBinding::new("secondary-f", FindNext, None),
+            KeyBinding::new("secondary-h", ToggleReplace, None),
             KeyBinding::new("secondary-g", Goto, None),
             KeyBinding::new("secondary-d", CompareNext, None),
             KeyBinding::new("secondary-\\", ToggleSplit, None),
@@ -3149,12 +3507,15 @@ pub fn run_app() {
                     MenuItem::action("Delete Selection", DeleteSelection),
                     MenuItem::action("Select All", SelectAll),
                     MenuItem::action("Goto Offset", Goto),
+                    MenuItem::action("Replace", ToggleReplace),
                 ],
             },
             Menu {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Find Clipboard", FindNext),
+                    MenuItem::action("Replace Next", ReplaceNext),
+                    MenuItem::action("Replace All", ReplaceAll),
                     MenuItem::action("Compare Next File", CompareNext),
                     MenuItem::action("Toggle Split View", ToggleSplit),
                     MenuItem::action("Move Active File To Other Pane", MoveToOtherSplit),

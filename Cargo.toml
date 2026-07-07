@@ -1,6 +1,6 @@
 [package]
 name = "byteforge"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A modern Rust + GPUI binary editor prototype with virtualized hex rendering and piece-table editing."
 license = "MIT"

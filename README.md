@@ -10,7 +10,7 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 - Open one or more files from the toolbar/menu or by dragging files onto the window.
 - Left/right split view with independent file tabs, active tab state, file assignment, and pane focus.
 - Virtualized hex view using GPUI `uniform_list`; only visible rows are rendered.
-- Always-visible hex viewport scrollbar rail.
+- GPUI Component-backed hex viewport scrollbar.
 - Memory-mapped original file content through `memmap2`.
 - Piece-table editing model for insert, overwrite, replacement, and arbitrary range deletion.
 - Insert and overwrite modes.
@@ -24,7 +24,8 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 - Preview encoding toggle: UTF-8, UTF-16LE, UTF-16BE, Shift-JIS, ASCII.
 - Same-offset multi-file comparison highlighting.
 - Clipboard search: parses hex first, then falls back to literal text bytes, and scrolls to hits.
-- Goto offset input with decimal and `0x` hexadecimal forms.
+- Replace panel for step-by-step replacement and replace-all using hex bytes or text.
+- Goto offset text box with decimal and `0x` hexadecimal forms.
 - Headless GPUI test suite covering the implemented UI actions.
 
 ## Download
@@ -74,6 +75,7 @@ target\release\byteforge.exe path\to\file.bin
 | `Ctrl+A` | Select all |
 | `Delete` / `Backspace` | Delete selection |
 | `Ctrl+F` | Find clipboard bytes |
+| `Ctrl+H` | Open replacement panel |
 | `Ctrl+G` | Goto offset |
 | `Ctrl+D` | Compare with next open file |
 | `Ctrl+\` | Toggle split view |
