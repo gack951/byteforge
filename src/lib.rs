@@ -12,13 +12,17 @@ use core::{
     detect_format_fields, find_bytes, inspector_values, parse_hex_bytes,
 };
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, ExternalPaths,
-    FocusHandle, Focusable, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ScrollStrategy, SharedString, SystemMenuType,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
-    rgb, rgba, size, uniform_list,
+    Action, AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, Corner,
+    DismissEvent, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, KeyBinding,
+    KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, ScrollStrategy, SharedString, SystemMenuType, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions, actions, canvas, div, prelude::*, px, rgb, rgba, size,
+    uniform_list,
 };
 use gpui_component::{
+    button::Button,
+    menu::{PopupMenu, PopupMenuItem},
+    popover::Popover,
     scroll::ScrollableElement,
     tab::{Tab, TabBar},
 };
@@ -133,6 +137,8 @@ struct ByteForge {
     replace_input: String,
     active_text_field: Option<TextField>,
     text_selection: Option<Range<usize>>,
+    active_toolbar_menu: Option<&'static str>,
+    toolbar_menu_bounds: Vec<(&'static str, Bounds<Pixels>)>,
     left_scroll_handle: UniformListScrollHandle,
     right_scroll_handle: UniformListScrollHandle,
     #[cfg(test)]
@@ -141,6 +147,11 @@ struct ByteForge {
     test_save_path: Option<PathBuf>,
     status: SharedString,
     focus_handle: FocusHandle,
+}
+
+#[derive(Default)]
+struct ToolbarMenuState {
+    menu: Option<Entity<PopupMenu>>,
 }
 
 impl ByteForge {
@@ -175,6 +186,8 @@ impl ByteForge {
             replace_input: String::new(),
             active_text_field: None,
             text_selection: None,
+            active_toolbar_menu: None,
+            toolbar_menu_bounds: Vec::new(),
             left_scroll_handle: UniformListScrollHandle::new(),
             right_scroll_handle: UniformListScrollHandle::new(),
             #[cfg(test)]
@@ -210,6 +223,8 @@ impl ByteForge {
             replace_input: String::new(),
             active_text_field: None,
             text_selection: None,
+            active_toolbar_menu: None,
+            toolbar_menu_bounds: Vec::new(),
             left_scroll_handle: UniformListScrollHandle::new(),
             right_scroll_handle: UniformListScrollHandle::new(),
             #[cfg(test)]
@@ -1149,6 +1164,33 @@ impl ByteForge {
         self.confirm_goto(cx);
     }
 
+    fn set_toolbar_menu_bounds(&mut self, id: &'static str, bounds: Bounds<Pixels>) {
+        if let Some((_, existing_bounds)) = self
+            .toolbar_menu_bounds
+            .iter_mut()
+            .find(|(existing_id, _)| *existing_id == id)
+        {
+            *existing_bounds = bounds;
+        } else {
+            self.toolbar_menu_bounds.push((id, bounds));
+        }
+    }
+
+    fn switch_toolbar_menu_for_mouse(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if self.active_toolbar_menu.is_none() {
+            return;
+        }
+
+        let hovered_menu = self
+            .toolbar_menu_bounds
+            .iter()
+            .find_map(|(id, bounds)| bounds.contains(&event.position).then_some(*id));
+        if hovered_menu.is_some() && hovered_menu != self.active_toolbar_menu {
+            self.active_toolbar_menu = hovered_menu;
+            cx.notify();
+        }
+    }
+
     fn input_hex_nibble(&mut self, nibble: u8, cx: &mut Context<Self>) {
         if self.active_doc().is_none() {
             return;
@@ -1221,7 +1263,6 @@ impl ByteForge {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
-            .flex_col()
             .flex_shrink_0()
             .w_full()
             .gap_1()
@@ -1236,120 +1277,312 @@ impl ByteForge {
                     .flex_wrap()
                     .items_center()
                     .gap_1()
-                    .child(self.toolbar_button(
-                        "open",
-                        "Open",
-                        Some("Ctrl+O"),
-                        cx.listener(|this, _, window, cx| this.open_files(&OpenFiles, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "save",
-                        "Save",
-                        Some("Ctrl+S"),
-                        cx.listener(|this, _, window, cx| this.save(&Save, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "save-as",
-                        "Save As",
-                        Some("Ctrl+Shift+S"),
-                        cx.listener(|this, _, window, cx| this.save_as(&SaveAs, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "copy-hex",
-                        "Copy Hex",
-                        Some("Ctrl+C"),
-                        cx.listener(|this, _, window, cx| this.copy_hex(&CopyHex, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "copy-text",
-                        "Copy Text",
-                        Some("Ctrl+Shift+C"),
-                        cx.listener(|this, _, window, cx| this.copy_text(&CopyText, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "undo",
-                        "Undo",
-                        Some("Ctrl+Z"),
-                        cx.listener(|this, _, window, cx| this.undo(&Undo, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "redo",
-                        "Redo",
-                        Some("Ctrl+Y"),
-                        cx.listener(|this, _, window, cx| this.redo(&Redo, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "paste-hex",
-                        "Paste Hex",
-                        Some("Ctrl+V"),
-                        cx.listener(|this, _, window, cx| this.paste_hex(&PasteHex, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "paste-text",
-                        "Paste Text",
-                        Some("Ctrl+Shift+V"),
-                        cx.listener(|this, _, window, cx| this.paste_text(&PasteText, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "delete",
-                        "Delete",
-                        Some("Del"),
-                        cx.listener(|this, _, window, cx| {
-                            this.delete_selection(&DeleteSelection, window, cx)
-                        }),
-                    )),
+                    .child(self.toolbar_menu_button(cx, "file", "File", |menu| {
+                        menu.item(Self::menu_item(
+                            "open",
+                            "Open Files...",
+                            Some("Ctrl+O"),
+                            OpenFiles,
+                        ))
+                        .item(Self::menu_item("save", "Save", Some("Ctrl+S"), Save))
+                        .item(Self::menu_item(
+                            "save-as",
+                            "Save As...",
+                            Some("Ctrl+Shift+S"),
+                            SaveAs,
+                        ))
+                    }))
+                    .child(self.toolbar_menu_button(cx, "edit", "Edit", |menu| {
+                        menu.item(Self::menu_item("undo", "Undo", Some("Ctrl+Z"), Undo))
+                            .item(Self::menu_item("redo", "Redo", Some("Ctrl+Y"), Redo))
+                            .separator()
+                            .item(Self::menu_item(
+                                "copy-hex",
+                                "Copy Hex",
+                                Some("Ctrl+C"),
+                                CopyHex,
+                            ))
+                            .item(Self::menu_item(
+                                "copy-text",
+                                "Copy Text",
+                                Some("Ctrl+Shift+C"),
+                                CopyText,
+                            ))
+                            .item(Self::menu_item("cut", "Cut", Some("Ctrl+X"), Cut))
+                            .item(Self::menu_item(
+                                "paste-hex",
+                                "Paste Hex",
+                                Some("Ctrl+V"),
+                                PasteHex,
+                            ))
+                            .item(Self::menu_item(
+                                "paste-text",
+                                "Paste Text",
+                                Some("Ctrl+Shift+V"),
+                                PasteText,
+                            ))
+                            .item(Self::menu_item(
+                                "delete",
+                                "Delete Selection",
+                                Some("Del"),
+                                DeleteSelection,
+                            ))
+                            .item(Self::menu_item(
+                                "select-all",
+                                "Select All",
+                                Some("Ctrl+A"),
+                                SelectAll,
+                            ))
+                    }))
+                    .child(self.toolbar_menu_button(cx, "search", "Search", |menu| {
+                        menu.item(Self::menu_item(
+                            "find-clip",
+                            "Find Clipboard",
+                            Some("Ctrl+F"),
+                            FindNext,
+                        ))
+                        .item(Self::menu_item(
+                            "replace",
+                            "Open Replacement Panel",
+                            Some("Ctrl+H"),
+                            ToggleReplace,
+                        ))
+                        .item(Self::menu_item(
+                            "goto",
+                            "Goto Offset",
+                            Some("Ctrl+G"),
+                            Goto,
+                        ))
+                    }))
+                    .child(self.toolbar_menu_button(cx, "view", "View", |menu| {
+                        menu.item(Self::menu_item(
+                            "compare",
+                            "Compare Next File",
+                            Some("Ctrl+D"),
+                            CompareNext,
+                        ))
+                        .item(Self::menu_item(
+                            "split",
+                            "Toggle Split View",
+                            Some("Ctrl+\\"),
+                            ToggleSplit,
+                        ))
+                        .item(Self::menu_item(
+                            "move-pane",
+                            "Move Active File To Other Pane",
+                            Some("Ctrl+M"),
+                            MoveToOtherSplit,
+                        ))
+                        .separator()
+                        .item(Self::menu_item(
+                            "focus-left",
+                            "Focus Left Pane",
+                            Some("Ctrl+1"),
+                            FocusLeftPane,
+                        ))
+                        .item(Self::menu_item(
+                            "focus-right",
+                            "Focus Right Pane",
+                            Some("Ctrl+2"),
+                            FocusRightPane,
+                        ))
+                        .separator()
+                        .item(Self::menu_item(
+                            "row-width",
+                            "Cycle Bytes Per Row",
+                            Some("Ctrl+B"),
+                            NextRowWidth,
+                        ))
+                        .item(Self::menu_item(
+                            "edit-mode",
+                            "Toggle Insert/Overwrite",
+                            Some("Ins"),
+                            ToggleInsertMode,
+                        ))
+                        .item(Self::menu_item(
+                            "endian",
+                            "Toggle Endian",
+                            Some("Ctrl+Alt+E"),
+                            ToggleEndian,
+                        ))
+                        .item(Self::menu_item(
+                            "encoding",
+                            "Cycle Text Encoding",
+                            Some("Ctrl+Alt+N"),
+                            NextEncoding,
+                        ))
+                    })),
             )
+    }
+
+    fn toolbar_menu_button(
+        &self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        label: &'static str,
+        build_menu: impl Fn(PopupMenu) -> PopupMenu + 'static,
+    ) -> AnyElement {
+        let view = cx.entity();
+        let focus_handle = self.focus_handle.clone();
+        let button_id: ElementId = SharedString::from(format!("toolbar-menu-{id}")).into();
+        let menu_state_id: ElementId =
+            SharedString::from(format!("toolbar-menu-state-{id}")).into();
+        let is_open = self.active_toolbar_menu == Some(id);
+
+        div()
+            .debug_selector(|| format!("button-menu-{id}"))
+            .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                if this.active_toolbar_menu.is_some() && this.active_toolbar_menu != Some(id) {
+                    this.active_toolbar_menu = Some(id);
+                    cx.notify();
+                }
+            }))
             .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1()
-                    .child(self.toolbar_button(
-                        "find-clip",
-                        "Find",
-                        Some("Ctrl+F"),
-                        cx.listener(|this, _, window, cx| this.find_next(&FindNext, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "replace",
-                        "Replace",
-                        Some("Ctrl+H"),
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_replace(&ToggleReplace, window, cx)
-                        }),
-                    ))
-                    .child(self.toolbar_button(
-                        "goto",
-                        "Goto",
-                        Some("Ctrl+G"),
-                        cx.listener(|this, _, window, cx| this.goto(&Goto, window, cx)),
-                    ))
-                    .child(self.toolbar_button(
-                        "compare",
-                        "Compare",
-                        Some("Ctrl+D"),
-                        cx.listener(|this, _, window, cx| {
-                            this.compare_next(&CompareNext, window, cx)
-                        }),
-                    ))
-                    .child(self.toolbar_button(
-                        "split",
-                        "Split",
-                        Some("Ctrl+\\"),
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_split(&ToggleSplit, window, cx)
-                        }),
-                    ))
-                    .child(self.toolbar_button(
-                        "move-pane",
-                        "Move Pane",
-                        Some("Ctrl+M"),
-                        cx.listener(|this, _, window, cx| {
-                            this.move_to_other_split(&MoveToOtherSplit, window, cx)
-                        }),
-                    )),
+                canvas(
+                    {
+                        let view = view.clone();
+                        move |bounds, _, cx| {
+                            _ = view.update(cx, |this, _| {
+                                this.set_toolbar_menu_bounds(id, bounds);
+                            });
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
             )
+            .child(if is_open {
+                Popover::new(SharedString::from(format!("toolbar-menu-popover-{id}")))
+                    .appearance(false)
+                    .overlay_closable(false)
+                    .open(true)
+                    .on_open_change({
+                        let view = view.clone();
+                        move |open, _window, cx| {
+                            _ = view.update(cx, |this, cx| {
+                                if *open {
+                                    this.active_toolbar_menu = Some(id);
+                                } else if this.active_toolbar_menu == Some(id) {
+                                    this.active_toolbar_menu = None;
+                                }
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .trigger(
+                        Button::new(button_id.clone())
+                            .label(label)
+                            .compact()
+                            .dropdown_caret(true)
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered
+                                    && this.active_toolbar_menu.is_some()
+                                    && this.active_toolbar_menu != Some(id)
+                                {
+                                    this.active_toolbar_menu = Some(id);
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .anchor(Corner::TopLeft)
+                    .content(move |_, window, cx| {
+                        let menu_state =
+                            window.use_keyed_state(menu_state_id.clone(), cx, |_, _| {
+                                ToolbarMenuState::default()
+                            });
+                        let menu = match menu_state.read(cx).menu.clone() {
+                            Some(menu) => menu,
+                            None => {
+                                let menu = PopupMenu::build(window, cx, |menu, _, _| {
+                                    build_menu(
+                                        menu.action_context(focus_handle.clone()).min_w(px(260.0)),
+                                    )
+                                });
+                                menu_state.update(cx, |state, _| {
+                                    state.menu = Some(menu.clone());
+                                });
+                                menu.focus_handle(cx).focus(window);
+
+                                window
+                                    .subscribe(&menu, cx, {
+                                        let menu_state = menu_state.clone();
+                                        let view = view.clone();
+                                        move |_, _: &DismissEvent, _, cx| {
+                                            menu_state.update(cx, |state, _| {
+                                                state.menu = None;
+                                            });
+                                            _ = view.update(cx, |this, cx| {
+                                                if this.active_toolbar_menu == Some(id) {
+                                                    this.active_toolbar_menu = None;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }
+                                    })
+                                    .detach();
+
+                                menu
+                            }
+                        };
+
+                        menu
+                    })
+                    .into_any_element()
+            } else {
+                Button::new(button_id)
+                    .label(label)
+                    .compact()
+                    .dropdown_caret(true)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.active_toolbar_menu = Some(id);
+                        cx.notify();
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered
+                            && this.active_toolbar_menu.is_some()
+                            && this.active_toolbar_menu != Some(id)
+                        {
+                            this.active_toolbar_menu = Some(id);
+                            cx.notify();
+                        }
+                    }))
+                    .into_any_element()
+            })
+            .into_any_element()
+    }
+
+    fn menu_item(
+        id: &'static str,
+        label: &'static str,
+        shortcut: Option<&'static str>,
+        action: impl Action + 'static,
+    ) -> PopupMenuItem {
+        let label = SharedString::from(label);
+        let shortcut = shortcut.map(SharedString::from);
+        PopupMenuItem::element(move |_, _| {
+            div()
+                .debug_selector(move || format!("menu-item-{id}"))
+                .flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(div().child(label.clone()))
+                .children(shortcut.clone().map(|shortcut| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(17.0))
+                        .px_1()
+                        .rounded_sm()
+                        .bg(rgb(0x46505e))
+                        .text_color(rgb(0xe6edf7))
+                        .text_xs()
+                        .child(shortcut)
+                }))
+        })
+        .action(Box::new(action))
     }
 
     fn toolbar_button(
@@ -1359,15 +1592,29 @@ impl ByteForge {
         shortcut: Option<&'static str>,
         listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> AnyElement {
+        self.toolbar_button_sized(id, label, shortcut, None, listener)
+    }
+
+    fn toolbar_button_sized(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        shortcut: Option<&'static str>,
+        width: Option<f32>,
+        listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
         let shortcut = shortcut.map(SharedString::from);
         div()
             .id(id)
             .debug_selector(|| format!("button-{id}"))
             .flex()
+            .flex_none()
             .items_center()
+            .justify_center()
             .gap_1()
             .px_2()
             .py_1()
+            .when_some(width, |this, width| this.w(px(width)))
             .rounded_sm()
             .bg(rgb(0x303741))
             .text_color(rgb(0xe9eef5))
@@ -2142,50 +2389,56 @@ impl ByteForge {
                     .justify_end()
                     .items_center()
                     .gap_1()
-                    .child(self.toolbar_button(
+                    .child(self.toolbar_button_sized(
                         "focus-left",
                         "Left",
                         Some("Ctrl+1"),
+                        Some(78.0),
                         cx.listener(|this, _, window, cx| {
                             this.focus_left_pane(&FocusLeftPane, window, cx)
                         }),
                     ))
-                    .child(self.toolbar_button(
+                    .child(self.toolbar_button_sized(
                         "focus-right",
                         "Right",
                         Some("Ctrl+2"),
+                        Some(84.0),
                         cx.listener(|this, _, window, cx| {
                             this.focus_right_pane(&FocusRightPane, window, cx)
                         }),
                     ))
-                    .child(self.toolbar_button(
+                    .child(self.toolbar_button_sized(
                         "row-width",
                         format!("{} B/row", self.bytes_per_row()),
                         Some("Ctrl+B"),
+                        Some(116.0),
                         cx.listener(|this, _, window, cx| {
                             this.next_row_width(&NextRowWidth, window, cx)
                         }),
                     ))
-                    .child(self.toolbar_button(
+                    .child(self.toolbar_button_sized(
                         "edit-mode",
                         self.edit_mode.label(),
                         Some("Ins"),
+                        Some(112.0),
                         cx.listener(|this, _, window, cx| {
                             this.toggle_insert_mode(&ToggleInsertMode, window, cx)
                         }),
                     ))
-                    .child(self.toolbar_button(
+                    .child(self.toolbar_button_sized(
                         "endian",
                         endian_label,
                         Some("Ctrl+Alt+E"),
+                        Some(142.0),
                         cx.listener(|this, _, window, cx| {
                             this.toggle_endian(&ToggleEndian, window, cx)
                         }),
                     ))
-                    .child(self.toolbar_button(
+                    .child(self.toolbar_button_sized(
                         "encoding",
                         self.encoding.label(),
                         Some("Ctrl+Alt+N"),
+                        Some(142.0),
                         cx.listener(|this, _, window, cx| {
                             this.next_encoding(&NextEncoding, window, cx)
                         }),
@@ -2202,9 +2455,26 @@ impl Focusable for ByteForge {
 
 impl Render for ByteForge {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+
         div()
             .size_full()
             .overflow_hidden()
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let view = view.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                            _ = view.update(cx, |this, cx| {
+                                this.switch_toolbar_menu_for_mouse(event, cx);
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
             .track_focus(&self.focus_handle(cx))
             .key_context("ByteForge")
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
@@ -2387,6 +2657,33 @@ mod tests {
         cx.simulate_click(bounds.center(), Modifiers::default());
     }
 
+    fn hover_button(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing button bounds for {selector}"));
+        assert!(
+            bounds.size.width > gpui::Pixels::ZERO && bounds.size.height > gpui::Pixels::ZERO,
+            "{selector} has no hoverable size: {:?}",
+            bounds
+        );
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+    }
+
+    fn click_dropdown_item(
+        cx: &mut VisualTestContext,
+        view: &Entity<ByteForge>,
+        menu_selector: &'static str,
+        item_selector: &'static str,
+        width: f32,
+        height: f32,
+    ) {
+        click_button(cx, menu_selector);
+        draw_visual_app_at(cx, view, width, height);
+        assert_visible(cx, item_selector, width, height);
+        click_button(cx, item_selector);
+        draw_visual_app_at(cx, view, width, height);
+    }
+
     fn sample_png_document() -> ByteDocument {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\x89PNG\r\n\x1A\n");
@@ -2509,7 +2806,10 @@ mod tests {
         let height = 820.0;
         draw_visual_app_at(cx, &view, width, height);
         for selector in [
-            "button-goto",
+            "button-menu-file",
+            "button-menu-edit",
+            "button-menu-search",
+            "button-menu-view",
             "button-edit-mode",
             "button-endian",
             "button-encoding",
@@ -2532,8 +2832,14 @@ mod tests {
             "top toolbar replace-all button should not be rendered"
         );
 
-        click_button(cx, "button-replace");
-        draw_visual_app_at(cx, &view, width, height);
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-search",
+            "menu-item-replace",
+            width,
+            height,
+        );
         for selector in [
             "replace-panel",
             "replace-find-input",
@@ -2544,10 +2850,53 @@ mod tests {
             assert_visible(cx, selector, width, height);
         }
 
-        click_button(cx, "button-goto");
-        draw_visual_app_at(cx, &view, width, height);
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-search",
+            "menu-item-goto",
+            width,
+            height,
+        );
         assert_visible(cx, "goto-input", width, height);
         view.update(cx, |view, _| assert!(view.goto_open));
+
+        let endian_x = cx.debug_bounds("button-endian").unwrap().origin.x;
+        let encoding_x = cx.debug_bounds("button-encoding").unwrap().origin.x;
+        click_button(cx, "button-edit-mode");
+        draw_visual_app_at(cx, &view, width, height);
+        assert_eq!(cx.debug_bounds("button-endian").unwrap().origin.x, endian_x);
+        assert_eq!(
+            cx.debug_bounds("button-encoding").unwrap().origin.x,
+            encoding_x
+        );
+    }
+
+    #[gpui::test]
+    fn open_toolbar_menu_switches_on_hover(cx: &mut TestAppContext) {
+        cx.update(bind_test_keys);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            ByteForge::with_documents(
+                vec![ByteDocument::from_bytes("hover.bin", b"abcdef".to_vec())],
+                cx,
+            )
+        });
+
+        let width = 1280.0;
+        let height = 820.0;
+        draw_visual_app_at(cx, &view, width, height);
+        click_button(cx, "button-menu-file");
+        draw_visual_app_at(cx, &view, width, height);
+        assert_visible(cx, "menu-item-open", width, height);
+        assert!(cx.debug_bounds("menu-item-undo").is_none());
+
+        hover_button(cx, "button-menu-edit");
+        draw_visual_app_at(cx, &view, width, height);
+        view.update(cx, |view, _| {
+            assert_eq!(view.active_toolbar_menu, Some("edit"));
+        });
+        draw_visual_app_at(cx, &view, width, height);
+        assert_visible(cx, "menu-item-undo", width, height);
     }
 
     #[gpui::test]
@@ -2816,7 +3165,14 @@ mod tests {
         view.update(cx, |view, _| {
             view.test_open_paths = Some(vec![open_path.clone()])
         });
-        click_button(cx, "button-open");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-file",
+            "menu-item-open",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| {
             assert_eq!(view.docs.len(), 3);
             assert_eq!(
@@ -2831,7 +3187,14 @@ mod tests {
                 .overwrite(0, b"X".to_vec())
                 .unwrap();
         });
-        click_button(cx, "button-save");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-file",
+            "menu-item-save",
+            1600.0,
+            900.0,
+        );
         assert_eq!(std::fs::read(&open_path).unwrap(), b"Xpened");
 
         view.update(cx, |view, _| {
@@ -2839,11 +3202,25 @@ mod tests {
             view.focused_pane = PaneSide::Left;
             view.test_save_path = Some(save_path.clone());
         });
-        click_button(cx, "button-save-as");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-file",
+            "menu-item-save-as",
+            1600.0,
+            900.0,
+        );
         assert_eq!(std::fs::read(&save_path).unwrap(), b"abcdef");
 
         view.update(cx, |view, cx| view.set_cursor(1, false, cx));
-        click_button(cx, "button-copy-hex");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-copy-hex",
+            1600.0,
+            900.0,
+        );
         let copied = view.update(cx, |_, cx| {
             cx.read_from_clipboard()
                 .and_then(|item| item.text())
@@ -2851,7 +3228,14 @@ mod tests {
         });
         assert_eq!(copied, "62");
 
-        click_button(cx, "button-copy-text");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-copy-text",
+            1600.0,
+            900.0,
+        );
         let copied = view.update(cx, |_, cx| {
             cx.read_from_clipboard()
                 .and_then(|item| item.text())
@@ -2864,9 +3248,23 @@ mod tests {
             view.set_cursor(0, false, cx);
             view.apply_bytes(b"X".to_vec()).unwrap();
         });
-        click_button(cx, "button-undo");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-undo",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"abcdef"));
-        click_button(cx, "button-redo");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-redo",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"Xabcdef"));
 
         view.update(cx, |view, cx| {
@@ -2876,7 +3274,14 @@ mod tests {
             view.set_cursor(1, false, cx);
             cx.write_to_clipboard(ClipboardItem::new_string("CA FE".to_string()));
         });
-        click_button(cx, "button-paste-hex");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-paste-hex",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"a\xCA\xFEbcdef"));
 
         view.update(cx, |view, cx| {
@@ -2886,7 +3291,14 @@ mod tests {
             view.set_cursor(2, false, cx);
             cx.write_to_clipboard(ClipboardItem::new_string("Z".to_string()));
         });
-        click_button(cx, "button-paste-text");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-paste-text",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"abZcdef"));
 
         view.update(cx, |view, cx| {
@@ -2894,7 +3306,14 @@ mod tests {
             view.active = 0;
             view.set_cursor(0, false, cx);
         });
-        click_button(cx, "button-delete");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-edit",
+            "menu-item-delete",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"bcdef"));
 
         view.update(cx, |view, cx| {
@@ -2903,20 +3322,55 @@ mod tests {
             view.set_cursor(0, false, cx);
             cx.write_to_clipboard(ClipboardItem::new_string("64".to_string()));
         });
-        click_button(cx, "button-find-clip");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-search",
+            "menu-item-find-clip",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(view.selection_range(), Some(3..4)));
 
-        click_button(cx, "button-goto");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-search",
+            "menu-item-goto",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert!(view.goto_open));
         view.update(cx, |view, _| view.goto_open = false);
 
-        click_button(cx, "button-compare");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-view",
+            "menu-item-compare",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(view.compare_with, Some(1)));
 
-        click_button(cx, "button-split");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-view",
+            "menu-item-split",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert!(view.split));
 
-        click_button(cx, "button-move-pane");
+        click_dropdown_item(
+            cx,
+            &view,
+            "button-menu-view",
+            "menu-item-move-pane",
+            1600.0,
+            900.0,
+        );
         view.update(cx, |view, _| assert_eq!(view.focused_pane, PaneSide::Right));
 
         draw_visual_app(cx, &view);
