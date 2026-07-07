@@ -7,6 +7,7 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 ## Features
 
 - Multi-file workspace with tab switching.
+- Open one or more files from the toolbar/menu or by dragging files onto the window.
 - Left/right split view with independent file assignment and pane focus.
 - Virtualized hex view using GPUI `uniform_list`; only visible rows are rendered.
 - Memory-mapped original file content through `memmap2`.
@@ -18,7 +19,7 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 - Direct hex nibble input in the hex view.
 - Hex and text clipboard formats.
 - Save As that streams the current piece table to disk.
-- Inspector panel with offset, integer widths, floats, endian mode, and text preview.
+- Inspector panel with offset, integer widths, floats, endian mode, text preview, and read-only file-format fields for PNG, BMP, WAV, GIF, JPEG, and ZIP.
 - Preview encoding toggle: UTF-8, UTF-16LE, UTF-16BE, Shift-JIS, ASCII.
 - Same-offset multi-file comparison highlighting.
 - Clipboard search: parses hex first, then falls back to literal text bytes, and scrolls to hits.
@@ -49,7 +50,7 @@ cargo build --release
 target\release\byteforge.exe
 ```
 
-Open files from the toolbar/menu, or pass a file path:
+Open files from the toolbar/menu, drag files onto the window, or pass a file path:
 
 ```powershell
 target\release\byteforge.exe path\to\file.bin
@@ -77,6 +78,8 @@ target\release\byteforge.exe path\to\file.bin
 | `Ctrl+M` | Move active file to the other split pane |
 | `Ctrl+1` / `Ctrl+2` | Focus left/right split pane |
 | `Ctrl+B` | Cycle bytes per row |
+| `Ctrl+Alt+E` | Toggle endian mode |
+| `Ctrl+Alt+N` | Cycle preview encoding |
 | `Insert` | Toggle insert/overwrite |
 | Arrow keys | Move cursor |
 | `Shift+Left/Right` | Extend selection |
@@ -102,6 +105,7 @@ The test suite includes:
 - Piece-table insert/delete/overwrite/replace behavior.
 - Undo/redo and dirty-state behavior.
 - Hex parser and virtual-document search.
+- File-format detection for PNG, BMP, WAV, GIF, JPEG, and ZIP, including edited document bytes.
 - 32 MiB large-document viewport/edit/search performance guard.
 - GPUI headless tests for keyboard navigation, selection, Shift+click/drag selection state, direct hex input, copy/cut/paste/delete, undo/redo, find auto-scroll, Goto, split panes, EOF append cursor behavior, compare, mode toggles, tab activation, open-path, save-path, and 4 MiB document rendering.
 

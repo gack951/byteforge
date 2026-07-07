@@ -8,11 +8,11 @@ use std::{
 
 use anyhow::Result;
 use core::{
-    ByteDocument, Endianness, PreviewEncoding, Selection, find_bytes, inspector_values,
-    parse_hex_bytes,
+    ByteDocument, Endianness, FormatField, FormatSummary, PreviewEncoding, Selection,
+    detect_format_fields, find_bytes, inspector_values, parse_hex_bytes,
 };
 use gpui::{
-    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, ElementId,
+    AnyElement, App, Application, Bounds, ClickEvent, ClipboardItem, Context, ExternalPaths,
     FocusHandle, Focusable, KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ScrollStrategy, SharedString, SystemMenuType,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
@@ -105,6 +105,10 @@ struct ByteForge {
     goto_input: String,
     left_scroll_handle: UniformListScrollHandle,
     right_scroll_handle: UniformListScrollHandle,
+    #[cfg(test)]
+    test_open_paths: Option<Vec<PathBuf>>,
+    #[cfg(test)]
+    test_save_path: Option<PathBuf>,
     status: SharedString,
     focus_handle: FocusHandle,
 }
@@ -138,6 +142,10 @@ impl ByteForge {
             goto_input: String::new(),
             left_scroll_handle: UniformListScrollHandle::new(),
             right_scroll_handle: UniformListScrollHandle::new(),
+            #[cfg(test)]
+            test_open_paths: None,
+            #[cfg(test)]
+            test_save_path: None,
             status: "Open one or more files to begin.".into(),
             focus_handle: cx.focus_handle(),
         }
@@ -164,6 +172,10 @@ impl ByteForge {
             goto_input: String::new(),
             left_scroll_handle: UniformListScrollHandle::new(),
             right_scroll_handle: UniformListScrollHandle::new(),
+            #[cfg(test)]
+            test_open_paths: None,
+            #[cfg(test)]
+            test_save_path: None,
             status: "Ready.".into(),
             focus_handle: cx.focus_handle(),
         }
@@ -320,6 +332,13 @@ impl ByteForge {
     }
 
     fn open_files(&mut self, _: &OpenFiles, _: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Some(paths) = self.test_open_paths.take() {
+            self.open_paths(paths);
+            cx.notify();
+            return;
+        }
+
         let Some(paths) = rfd::FileDialog::new().pick_files() else {
             return;
         };
@@ -353,7 +372,22 @@ impl ByteForge {
         }
     }
 
+    fn open_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.open_paths(paths.to_vec());
+        cx.notify();
+    }
+
     fn save_as(&mut self, _: &SaveAs, _: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        if let Some(path) = self.test_save_path.take() {
+            self.save_active_as_path(&path);
+            cx.notify();
+            return;
+        }
+
         let Some(path) = rfd::FileDialog::new().save_file() else {
             return;
         };
@@ -922,7 +956,7 @@ impl ByteForge {
 
     fn toolbar_button(
         &self,
-        id: impl Into<ElementId>,
+        id: &'static str,
         label: impl Into<SharedString>,
         shortcut: Option<&'static str>,
         listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -930,6 +964,7 @@ impl ByteForge {
         let shortcut = shortcut.map(SharedString::from);
         div()
             .id(id)
+            .debug_selector(|| format!("button-{id}"))
             .flex()
             .items_center()
             .gap_1()
@@ -1318,6 +1353,9 @@ impl ByteForge {
     }
 
     fn render_inspector(&self) -> impl IntoElement {
+        let format_summary = self
+            .active_doc()
+            .and_then(|doc| detect_format_fields(doc, 96));
         let bytes = self
             .active_doc()
             .map(|doc| doc.read_range(self.cursor, 64))
@@ -1334,6 +1372,7 @@ impl ByteForge {
             .unwrap_or_else(|| "off".to_string());
 
         div()
+            .id("inspector")
             .w(px(300.0))
             .h_full()
             .bg(rgb(0x15181d))
@@ -1343,6 +1382,7 @@ impl ByteForge {
             .flex()
             .flex_col()
             .gap_2()
+            .overflow_y_scroll()
             .text_sm()
             .text_color(rgb(0xdbe4ef))
             .child(div().text_lg().child("Inspector"))
@@ -1382,6 +1422,8 @@ impl ByteForge {
                 ),
             )
             .child(div().h(px(1.0)).bg(rgb(0x303741)).my_2())
+            .child(self.render_format_section(format_summary))
+            .child(div().h(px(1.0)).bg(rgb(0x303741)).my_2())
             .children(
                 values
                     .into_iter()
@@ -1400,6 +1442,67 @@ impl ByteForge {
             .gap_2()
             .child(div().text_color(rgb(0x8792a2)).child(label.into()))
             .child(div().text_align(gpui::TextAlign::Right).child(value.into()))
+    }
+
+    fn render_format_section(&self, summary: Option<FormatSummary>) -> AnyElement {
+        let Some(summary) = summary else {
+            return self.meta_line("Format", "unknown").into_any_element();
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(self.meta_line("Format", summary.format))
+            .children(
+                summary
+                    .fields
+                    .into_iter()
+                    .map(|field| self.render_format_field(field)),
+            )
+            .into_any_element()
+    }
+
+    fn render_format_field(&self, field: FormatField) -> AnyElement {
+        let active = field.contains(self.cursor);
+        let background = if active { 0x26313d } else { 0x1b1f26 };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(rgb(background))
+            .border_1()
+            .border_color(if active { rgb(0x5a87c7) } else { rgb(0x303741) })
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x8d99aa))
+                            .child(format!("0x{:08X} +{}", field.offset, field.len)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x9fb1c8))
+                            .text_align(gpui::TextAlign::Right)
+                            .child(field.value),
+                    ),
+            )
+            .child(div().text_color(rgb(0xe3ebf6)).child(field.name))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xaeb8c6))
+                    .child(field.meaning),
+            )
+            .into_any_element()
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1465,7 +1568,7 @@ impl ByteForge {
                     .child(self.toolbar_button(
                         "endian",
                         endian_label,
-                        None,
+                        Some("Ctrl+Alt+E"),
                         cx.listener(|this, _, window, cx| {
                             this.toggle_endian(&ToggleEndian, window, cx)
                         }),
@@ -1473,7 +1576,7 @@ impl ByteForge {
                     .child(self.toolbar_button(
                         "encoding",
                         self.encoding.label(),
-                        None,
+                        Some("Ctrl+Alt+N"),
                         cx.listener(|this, _, window, cx| {
                             this.next_encoding(&NextEncoding, window, cx)
                         }),
@@ -1494,6 +1597,9 @@ impl Render for ByteForge {
             .size_full()
             .track_focus(&self.focus_handle(cx))
             .key_context("ByteForge")
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.open_dropped_paths(paths.paths(), cx);
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::open_files))
             .on_action(cx.listener(Self::save_as))
@@ -1542,10 +1648,15 @@ impl Render for ByteForge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AvailableSpace, Keystroke, TestAppContext, WindowHandle, point, size};
+    use gpui::{
+        AvailableSpace, Entity, Keystroke, Modifiers, TestAppContext, VisualTestContext,
+        WindowHandle, point, size,
+    };
 
     fn bind_test_keys(cx: &mut App) {
         cx.bind_keys([
+            KeyBinding::new("secondary-o", OpenFiles, None),
+            KeyBinding::new("secondary-s", SaveAs, None),
             KeyBinding::new("secondary-c", CopyHex, None),
             KeyBinding::new("secondary-shift-c", CopyText, None),
             KeyBinding::new("secondary-x", Cut, None),
@@ -1563,6 +1674,8 @@ mod tests {
             KeyBinding::new("secondary-1", FocusLeftPane, None),
             KeyBinding::new("secondary-2", FocusRightPane, None),
             KeyBinding::new("secondary-b", NextRowWidth, None),
+            KeyBinding::new("secondary-alt-e", ToggleEndian, None),
+            KeyBinding::new("secondary-alt-n", NextEncoding, None),
             KeyBinding::new("insert", ToggleInsertMode, None),
             KeyBinding::new("left", MoveLeft, None),
             KeyBinding::new("right", MoveRight, None),
@@ -1601,6 +1714,24 @@ mod tests {
         cx.read_from_clipboard()
             .and_then(|item| item.text())
             .unwrap_or_default()
+    }
+
+    fn draw_visual_app(cx: &mut VisualTestContext, view: &Entity<ByteForge>) {
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(
+                AvailableSpace::Definite(px(1600.0)),
+                AvailableSpace::Definite(px(900.0)),
+            ),
+            |_, _| view.clone(),
+        );
+    }
+
+    fn click_button(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing button bounds for {selector}"));
+        cx.simulate_click(bounds.center(), Modifiers::default());
     }
 
     #[gpui::test]
@@ -1794,6 +1925,379 @@ mod tests {
     }
 
     #[gpui::test]
+    fn menu_buttons_click_dispatch_to_actions(cx: &mut TestAppContext) {
+        cx.update(bind_test_keys);
+        let mut open_path = std::env::temp_dir();
+        open_path.push(format!(
+            "byteforge-button-open-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&open_path, b"opened").unwrap();
+
+        let mut save_path = std::env::temp_dir();
+        save_path.push(format!(
+            "byteforge-button-save-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            ByteForge::with_documents(
+                vec![
+                    ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec()),
+                    ByteDocument::from_bytes("other.bin", b"abcxef".to_vec()),
+                ],
+                cx,
+            )
+        });
+        draw_visual_app(cx, &view);
+
+        view.update(cx, |view, _| {
+            view.test_open_paths = Some(vec![open_path.clone()])
+        });
+        click_button(cx, "button-open");
+        view.update(cx, |view, _| {
+            assert_eq!(view.docs.len(), 3);
+            assert_eq!(
+                view.active_doc().unwrap().name(),
+                open_path.file_name().unwrap().to_string_lossy()
+            );
+        });
+
+        view.update(cx, |view, _| {
+            view.active = 0;
+            view.focused_pane = PaneSide::Left;
+            view.test_save_path = Some(save_path.clone());
+        });
+        click_button(cx, "button-save-as");
+        assert_eq!(std::fs::read(&save_path).unwrap(), b"abcdef");
+
+        view.update(cx, |view, cx| view.set_cursor(1, false, cx));
+        click_button(cx, "button-copy-hex");
+        let copied = view.update(cx, |_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        });
+        assert_eq!(copied, "62");
+
+        click_button(cx, "button-copy-text");
+        let copied = view.update(cx, |_, cx| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        });
+        assert_eq!(copied, "b");
+
+        view.update(cx, |view, cx| {
+            view.edit_mode = EditMode::Insert;
+            view.set_cursor(0, false, cx);
+            view.apply_bytes(b"X".to_vec()).unwrap();
+        });
+        click_button(cx, "button-undo");
+        view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"abcdef"));
+        click_button(cx, "button-redo");
+        view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"Xabcdef"));
+
+        view.update(cx, |view, cx| {
+            view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+            view.active = 0;
+            view.edit_mode = EditMode::Insert;
+            view.set_cursor(1, false, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("CA FE".to_string()));
+        });
+        click_button(cx, "button-paste-hex");
+        view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"a\xCA\xFEbcdef"));
+
+        view.update(cx, |view, cx| {
+            view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+            view.active = 0;
+            view.edit_mode = EditMode::Insert;
+            view.set_cursor(2, false, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("Z".to_string()));
+        });
+        click_button(cx, "button-paste-text");
+        view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"abZcdef"));
+
+        view.update(cx, |view, cx| {
+            view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+            view.active = 0;
+            view.set_cursor(0, false, cx);
+        });
+        click_button(cx, "button-delete");
+        view.update(cx, |view, _| assert_eq!(doc_bytes(view), b"bcdef"));
+
+        view.update(cx, |view, cx| {
+            view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+            view.active = 0;
+            view.set_cursor(0, false, cx);
+            cx.write_to_clipboard(ClipboardItem::new_string("64".to_string()));
+        });
+        click_button(cx, "button-find-clip");
+        view.update(cx, |view, _| assert_eq!(view.selection_range(), Some(3..4)));
+
+        click_button(cx, "button-goto");
+        view.update(cx, |view, _| assert!(view.goto_open));
+        view.update(cx, |view, _| view.goto_open = false);
+
+        click_button(cx, "button-compare");
+        view.update(cx, |view, _| assert_eq!(view.compare_with, Some(1)));
+
+        click_button(cx, "button-split");
+        view.update(cx, |view, _| assert!(view.split));
+
+        click_button(cx, "button-move-pane");
+        view.update(cx, |view, _| assert_eq!(view.focused_pane, PaneSide::Right));
+
+        draw_visual_app(cx, &view);
+        click_button(cx, "button-focus-left");
+        view.update(cx, |view, _| assert_eq!(view.focused_pane, PaneSide::Left));
+        click_button(cx, "button-focus-right");
+        view.update(cx, |view, _| assert_eq!(view.focused_pane, PaneSide::Right));
+
+        let original_row_width = view.update(cx, |view, _| view.bytes_per_row());
+        click_button(cx, "button-row-width");
+        view.update(cx, |view, _| {
+            assert_ne!(view.bytes_per_row(), original_row_width)
+        });
+
+        let original_mode = view.update(cx, |view, _| view.edit_mode);
+        click_button(cx, "button-edit-mode");
+        view.update(cx, |view, _| assert_ne!(view.edit_mode, original_mode));
+
+        let original_endian = view.update(cx, |view, _| view.endian);
+        click_button(cx, "button-endian");
+        view.update(cx, |view, _| assert_ne!(view.endian, original_endian));
+
+        let original_encoding = view.update(cx, |view, _| view.encoding);
+        click_button(cx, "button-encoding");
+        view.update(cx, |view, _| assert_ne!(view.encoding, original_encoding));
+
+        let _ = std::fs::remove_file(open_path);
+        let _ = std::fs::remove_file(save_path);
+    }
+
+    #[gpui::test]
+    fn menu_button_shortcuts_dispatch_to_actions(cx: &mut TestAppContext) {
+        let mut open_path = std::env::temp_dir();
+        open_path.push(format!(
+            "byteforge-shortcut-open-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&open_path, b"opened").unwrap();
+
+        let mut save_path = std::env::temp_dir();
+        save_path.push(format!(
+            "byteforge-shortcut-save-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let window = open_test_window(
+            cx,
+            vec![
+                ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec()),
+                ByteDocument::from_bytes("other.bin", b"abcxef".to_vec()),
+            ],
+        );
+
+        window
+            .update(cx, |view, _, _| {
+                view.test_open_paths = Some(vec![open_path.clone()]);
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-o").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.docs.len(), 3);
+                assert_eq!(
+                    view.active_doc().unwrap().name(),
+                    open_path.file_name().unwrap().to_string_lossy()
+                );
+                view.active = 0;
+                view.focused_pane = PaneSide::Left;
+                view.test_save_path = Some(save_path.clone());
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-s").unwrap());
+        assert_eq!(std::fs::read(&save_path).unwrap(), b"abcdef");
+
+        window
+            .update(cx, |view, _, cx| {
+                view.set_cursor(1, false, cx);
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-c").unwrap());
+        window
+            .update(cx, |_, _, cx| assert_eq!(clipboard_text(cx), "62"))
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-shift-c").unwrap());
+        window
+            .update(cx, |_, _, cx| assert_eq!(clipboard_text(cx), "b"))
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+                view.active = 0;
+                view.edit_mode = EditMode::Insert;
+                view.set_cursor(1, false, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string("CA FE".to_string()));
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-v").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(doc_bytes(view), b"a\xCA\xFEbcdef")
+            })
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+                view.active = 0;
+                view.edit_mode = EditMode::Insert;
+                view.set_cursor(2, false, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string("Z".to_string()));
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-shift-v").unwrap());
+        window
+            .update(cx, |view, _, _| assert_eq!(doc_bytes(view), b"abZcdef"))
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+                view.active = 0;
+                view.set_cursor(0, false, cx);
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("delete").unwrap());
+        window
+            .update(cx, |view, _, _| assert_eq!(doc_bytes(view), b"bcdef"))
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+                view.active = 0;
+                view.set_cursor(0, false, cx);
+                cx.write_to_clipboard(ClipboardItem::new_string("64".to_string()));
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-f").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.selection_range(), Some(3..4))
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-g").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert!(view.goto_open);
+                view.goto_open = false;
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-d").unwrap());
+        window
+            .update(cx, |view, _, _| assert_eq!(view.compare_with, Some(1)))
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-\\").unwrap());
+        window.update(cx, |view, _, _| assert!(view.split)).unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-m").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.focused_pane, PaneSide::Right)
+            })
+            .unwrap();
+
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-1").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.focused_pane, PaneSide::Left)
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-2").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.focused_pane, PaneSide::Right)
+            })
+            .unwrap();
+
+        let original_row_width = window
+            .update(cx, |view, _, _| view.bytes_per_row())
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-b").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_ne!(view.bytes_per_row(), original_row_width)
+            })
+            .unwrap();
+
+        let original_mode = window.update(cx, |view, _, _| view.edit_mode).unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("insert").unwrap());
+        window
+            .update(cx, |view, _, _| assert_ne!(view.edit_mode, original_mode))
+            .unwrap();
+
+        let original_endian = window.update(cx, |view, _, _| view.endian).unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-alt-e").unwrap());
+        window
+            .update(cx, |view, _, _| assert_ne!(view.endian, original_endian))
+            .unwrap();
+
+        let original_encoding = window.update(cx, |view, _, _| view.encoding).unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-alt-n").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_ne!(view.encoding, original_encoding)
+            })
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abcdef".to_vec());
+                view.active = 0;
+                view.edit_mode = EditMode::Insert;
+                view.set_cursor(0, false, cx);
+                view.apply_bytes(b"X".to_vec()).unwrap();
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-z").unwrap());
+        window
+            .update(cx, |view, _, _| assert_eq!(doc_bytes(view), b"abcdef"))
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("secondary-y").unwrap());
+        window
+            .update(cx, |view, _, _| assert_eq!(doc_bytes(view), b"Xabcdef"))
+            .unwrap();
+
+        let _ = std::fs::remove_file(open_path);
+        let _ = std::fs::remove_file(save_path);
+    }
+
+    #[gpui::test]
     fn eof_cursor_append_and_cursor_delete(cx: &mut TestAppContext) {
         let window = open_test_window(
             cx,
@@ -1973,6 +2477,45 @@ mod tests {
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
     }
+
+    #[gpui::test]
+    fn dropped_paths_open_multiple_files(cx: &mut TestAppContext) {
+        let mut first = std::env::temp_dir();
+        first.push(format!(
+            "byteforge-drop-a-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut second = first.clone();
+        second.set_file_name(format!(
+            "byteforge-drop-b-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let window = open_test_window(cx, Vec::new());
+        window
+            .update(cx, |view, _, cx| {
+                view.open_dropped_paths(&[first.clone(), second.clone()], cx);
+                assert_eq!(view.docs.len(), 2);
+                assert_eq!(view.active, 0);
+                assert_eq!(view.docs[0].read_range(0, 5), b"first");
+                assert_eq!(view.docs[1].read_range(0, 6), b"second");
+                assert_eq!(view.status.as_ref(), "Opened 2 file(s).");
+            })
+            .unwrap();
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
 }
 
 fn pane_index(side: PaneSide) -> usize {
@@ -2037,6 +2580,8 @@ pub fn run_app() {
             KeyBinding::new("secondary-1", FocusLeftPane, None),
             KeyBinding::new("secondary-2", FocusRightPane, None),
             KeyBinding::new("secondary-b", NextRowWidth, None),
+            KeyBinding::new("secondary-alt-e", ToggleEndian, None),
+            KeyBinding::new("secondary-alt-n", NextEncoding, None),
             KeyBinding::new("insert", ToggleInsertMode, None),
             KeyBinding::new("left", MoveLeft, None),
             KeyBinding::new("right", MoveRight, None),

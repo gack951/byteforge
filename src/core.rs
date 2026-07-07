@@ -485,6 +485,55 @@ pub struct InspectorValue {
     pub value: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FormatField {
+    pub offset: u64,
+    pub len: u64,
+    pub name: String,
+    pub meaning: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FormatSummary {
+    pub format: String,
+    pub fields: Vec<FormatField>,
+}
+
+impl FormatField {
+    pub fn contains(&self, offset: u64) -> bool {
+        self.offset <= offset && offset < self.offset + self.len
+    }
+}
+
+pub fn detect_format_fields(doc: &ByteDocument, max_fields: usize) -> Option<FormatSummary> {
+    if max_fields == 0 || doc.is_empty() {
+        return None;
+    }
+
+    let header = doc.read_range(0, 16);
+    if header.starts_with(b"\x89PNG\r\n\x1A\n") {
+        return Some(parse_png_fields(doc, max_fields));
+    }
+    if header.starts_with(b"BM") {
+        return Some(parse_bmp_fields(doc, max_fields));
+    }
+    if header.len() >= 12 && &header[0..4] == b"RIFF" && &header[8..12] == b"WAVE" {
+        return Some(parse_wav_fields(doc, max_fields));
+    }
+    if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        return Some(parse_gif_fields(doc, max_fields));
+    }
+    if header.starts_with(b"\xFF\xD8") {
+        return Some(parse_jpeg_fields(doc, max_fields));
+    }
+    if header.starts_with(b"PK\x03\x04") {
+        return Some(parse_zip_fields(doc, max_fields));
+    }
+
+    None
+}
+
 pub fn inspector_values(
     bytes: &[u8],
     offset: u64,
@@ -602,6 +651,1043 @@ fn decode_with(encoding: &'static encoding_rs::Encoding, bytes: &[u8]) -> String
             }
         })
         .collect()
+}
+
+fn parse_png_fields(doc: &ByteDocument, max_fields: usize) -> FormatSummary {
+    let mut fields = Vec::new();
+    push_field(
+        &mut fields,
+        max_fields,
+        0,
+        8,
+        "PNG signature",
+        "PNGファイル識別子",
+        "89 50 4E 47 0D 0A 1A 0A",
+    );
+
+    let mut offset = 8;
+    while offset + 12 <= doc.len() && fields.len() < max_fields {
+        let Some(length) = read_u32_be(doc, offset) else {
+            break;
+        };
+        let chunk_type = read_ascii(doc, offset + 4, 4).unwrap_or_else(|| "????".to_string());
+        let data_offset = offset + 8;
+        let crc_offset = data_offset + length as u64;
+        if crc_offset + 4 > doc.len() {
+            push_field(
+                &mut fields,
+                max_fields,
+                offset,
+                doc.len().saturating_sub(offset),
+                "Truncated chunk",
+                "途中で終わっているPNGチャンク",
+                chunk_type,
+            );
+            break;
+        }
+
+        push_field(
+            &mut fields,
+            max_fields,
+            offset,
+            4,
+            format!("{chunk_type} length"),
+            "チャンクデータ長",
+            format!("{} bytes", length),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            offset + 4,
+            4,
+            format!("{chunk_type} type"),
+            "チャンク種別",
+            png_chunk_meaning(&chunk_type),
+        );
+
+        if chunk_type == "IHDR" && length >= 13 {
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset,
+                4,
+                "IHDR width",
+                "画像幅",
+                read_u32_be(doc, data_offset)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 4,
+                4,
+                "IHDR height",
+                "画像高さ",
+                read_u32_be(doc, data_offset + 4)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 8,
+                1,
+                "IHDR bit depth",
+                "ビット深度",
+                read_u8(doc, data_offset + 8)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let color_type = read_u8(doc, data_offset + 9).unwrap_or_default();
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 9,
+                1,
+                "IHDR color type",
+                "カラータイプ",
+                format!("{color_type} ({})", png_color_type(color_type)),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 10,
+                1,
+                "IHDR compression",
+                "圧縮方式",
+                read_u8(doc, data_offset + 10)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 11,
+                1,
+                "IHDR filter",
+                "フィルター方式",
+                read_u8(doc, data_offset + 11)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let interlace = read_u8(doc, data_offset + 12).unwrap_or_default();
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 12,
+                1,
+                "IHDR interlace",
+                "インターレース方式",
+                format!("{interlace} ({})", png_interlace(interlace)),
+            );
+        } else if length > 0 {
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset,
+                length as u64,
+                format!("{chunk_type} data"),
+                "チャンクデータ",
+                format!("{} bytes", length),
+            );
+        }
+
+        push_field(
+            &mut fields,
+            max_fields,
+            crc_offset,
+            4,
+            format!("{chunk_type} CRC"),
+            "チャンクCRC",
+            format!("0x{:08X}", read_u32_be(doc, crc_offset).unwrap_or_default()),
+        );
+
+        offset = crc_offset + 4;
+        if chunk_type == "IEND" {
+            break;
+        }
+    }
+
+    FormatSummary {
+        format: "PNG image".to_string(),
+        fields,
+    }
+}
+
+fn parse_bmp_fields(doc: &ByteDocument, max_fields: usize) -> FormatSummary {
+    let mut fields = Vec::new();
+    push_field(
+        &mut fields,
+        max_fields,
+        0,
+        2,
+        "Signature",
+        "BMP識別子",
+        read_ascii(doc, 0, 2).unwrap_or_default(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        2,
+        4,
+        "File size",
+        "ファイルサイズ",
+        format!("{} bytes", read_u32_le(doc, 2).unwrap_or_default()),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        6,
+        2,
+        "Reserved 1",
+        "予約領域1",
+        read_u16_le(doc, 6).unwrap_or_default().to_string(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        8,
+        2,
+        "Reserved 2",
+        "予約領域2",
+        read_u16_le(doc, 8).unwrap_or_default().to_string(),
+    );
+    let pixel_offset = read_u32_le(doc, 10).unwrap_or_default();
+    push_field(
+        &mut fields,
+        max_fields,
+        10,
+        4,
+        "Pixel data offset",
+        "ピクセルデータ開始位置",
+        format!("0x{pixel_offset:X} / {pixel_offset}"),
+    );
+
+    let dib_size = read_u32_le(doc, 14).unwrap_or_default();
+    push_field(
+        &mut fields,
+        max_fields,
+        14,
+        4,
+        "DIB header size",
+        "DIBヘッダサイズ",
+        format!("{} bytes", dib_size),
+    );
+    if dib_size >= 40 && doc.len() >= 54 {
+        push_field(
+            &mut fields,
+            max_fields,
+            18,
+            4,
+            "Width",
+            "画像幅",
+            read_i32_le(doc, 18).unwrap_or_default().to_string(),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            22,
+            4,
+            "Height",
+            "画像高さ",
+            read_i32_le(doc, 22).unwrap_or_default().to_string(),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            26,
+            2,
+            "Planes",
+            "プレーン数",
+            read_u16_le(doc, 26).unwrap_or_default().to_string(),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            28,
+            2,
+            "Bits per pixel",
+            "1ピクセルあたりのビット数",
+            read_u16_le(doc, 28).unwrap_or_default().to_string(),
+        );
+        let compression = read_u32_le(doc, 30).unwrap_or_default();
+        push_field(
+            &mut fields,
+            max_fields,
+            30,
+            4,
+            "Compression",
+            "圧縮方式",
+            format!("{compression} ({})", bmp_compression(compression)),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            34,
+            4,
+            "Image size",
+            "画像データサイズ",
+            format!("{} bytes", read_u32_le(doc, 34).unwrap_or_default()),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            38,
+            4,
+            "X pixels per meter",
+            "水平解像度",
+            read_i32_le(doc, 38).unwrap_or_default().to_string(),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            42,
+            4,
+            "Y pixels per meter",
+            "垂直解像度",
+            read_i32_le(doc, 42).unwrap_or_default().to_string(),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            46,
+            4,
+            "Colors used",
+            "カラーテーブル使用数",
+            read_u32_le(doc, 46).unwrap_or_default().to_string(),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            50,
+            4,
+            "Important colors",
+            "重要色数",
+            read_u32_le(doc, 50).unwrap_or_default().to_string(),
+        );
+    }
+
+    FormatSummary {
+        format: "BMP image".to_string(),
+        fields,
+    }
+}
+
+fn parse_wav_fields(doc: &ByteDocument, max_fields: usize) -> FormatSummary {
+    let mut fields = Vec::new();
+    push_field(
+        &mut fields,
+        max_fields,
+        0,
+        4,
+        "RIFF id",
+        "RIFF識別子",
+        read_ascii(doc, 0, 4).unwrap_or_default(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        4,
+        4,
+        "RIFF size",
+        "RIFFデータサイズ",
+        format!("{} bytes", read_u32_le(doc, 4).unwrap_or_default()),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        8,
+        4,
+        "Wave id",
+        "WAVE識別子",
+        read_ascii(doc, 8, 4).unwrap_or_default(),
+    );
+
+    let mut offset = 12;
+    while offset + 8 <= doc.len() && fields.len() < max_fields {
+        let chunk_id = read_ascii(doc, offset, 4).unwrap_or_else(|| "????".to_string());
+        let size = read_u32_le(doc, offset + 4).unwrap_or_default();
+        let data_offset = offset + 8;
+        if data_offset + size as u64 > doc.len() {
+            push_field(
+                &mut fields,
+                max_fields,
+                offset,
+                doc.len().saturating_sub(offset),
+                "Truncated chunk",
+                "途中で終わっているWAVチャンク",
+                chunk_id,
+            );
+            break;
+        }
+        push_field(
+            &mut fields,
+            max_fields,
+            offset,
+            4,
+            format!("{chunk_id} id"),
+            "チャンク識別子",
+            wav_chunk_meaning(&chunk_id),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            offset + 4,
+            4,
+            format!("{chunk_id} size"),
+            "チャンクデータサイズ",
+            format!("{} bytes", size),
+        );
+
+        if chunk_id == "fmt " && size >= 16 {
+            let audio_format = read_u16_le(doc, data_offset).unwrap_or_default();
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset,
+                2,
+                "Audio format",
+                "音声形式",
+                format!("{audio_format} ({})", wav_audio_format(audio_format)),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 2,
+                2,
+                "Channels",
+                "チャンネル数",
+                read_u16_le(doc, data_offset + 2)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 4,
+                4,
+                "Sample rate",
+                "サンプルレート",
+                format!(
+                    "{} Hz",
+                    read_u32_le(doc, data_offset + 4).unwrap_or_default()
+                ),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 8,
+                4,
+                "Byte rate",
+                "平均バイトレート",
+                format!(
+                    "{} bytes/sec",
+                    read_u32_le(doc, data_offset + 8).unwrap_or_default()
+                ),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 12,
+                2,
+                "Block align",
+                "ブロックアライン",
+                read_u16_le(doc, data_offset + 12)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset + 14,
+                2,
+                "Bits per sample",
+                "サンプルあたりビット数",
+                read_u16_le(doc, data_offset + 14)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        } else if chunk_id == "data" {
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset,
+                size as u64,
+                "Audio data",
+                "PCMなどの音声データ",
+                format!("{} bytes", size),
+            );
+        } else if size > 0 {
+            push_field(
+                &mut fields,
+                max_fields,
+                data_offset,
+                size as u64,
+                format!("{chunk_id} data"),
+                "チャンクデータ",
+                format!("{} bytes", size),
+            );
+        }
+
+        offset = data_offset + size as u64 + (size as u64 % 2);
+    }
+
+    FormatSummary {
+        format: "WAV audio".to_string(),
+        fields,
+    }
+}
+
+fn parse_gif_fields(doc: &ByteDocument, max_fields: usize) -> FormatSummary {
+    let mut fields = Vec::new();
+    push_field(
+        &mut fields,
+        max_fields,
+        0,
+        6,
+        "Signature",
+        "GIF署名とバージョン",
+        read_ascii(doc, 0, 6).unwrap_or_default(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        6,
+        2,
+        "Logical screen width",
+        "論理画面幅",
+        read_u16_le(doc, 6).unwrap_or_default().to_string(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        8,
+        2,
+        "Logical screen height",
+        "論理画面高さ",
+        read_u16_le(doc, 8).unwrap_or_default().to_string(),
+    );
+    let packed = read_u8(doc, 10).unwrap_or_default();
+    push_field(
+        &mut fields,
+        max_fields,
+        10,
+        1,
+        "Packed fields",
+        "グローバルカラーテーブル等のフラグ",
+        format!("0b{packed:08b}"),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        11,
+        1,
+        "Background color index",
+        "背景色インデックス",
+        read_u8(doc, 11).unwrap_or_default().to_string(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        12,
+        1,
+        "Pixel aspect ratio",
+        "ピクセル縦横比",
+        read_u8(doc, 12).unwrap_or_default().to_string(),
+    );
+    FormatSummary {
+        format: "GIF image".to_string(),
+        fields,
+    }
+}
+
+fn parse_jpeg_fields(doc: &ByteDocument, max_fields: usize) -> FormatSummary {
+    let mut fields = Vec::new();
+    push_field(
+        &mut fields,
+        max_fields,
+        0,
+        2,
+        "SOI",
+        "JPEG開始マーカー",
+        "FF D8",
+    );
+    let mut offset = 2;
+    while offset + 1 < doc.len() && fields.len() < max_fields {
+        if read_u8(doc, offset) != Some(0xFF) {
+            offset += 1;
+            continue;
+        }
+        while offset < doc.len() && read_u8(doc, offset) == Some(0xFF) {
+            offset += 1;
+        }
+        let Some(marker) = read_u8(doc, offset) else {
+            break;
+        };
+        let marker_offset = offset - 1;
+        offset += 1;
+        let marker_name = jpeg_marker_name(marker);
+        if marker == 0xD9 {
+            push_field(
+                &mut fields,
+                max_fields,
+                marker_offset,
+                2,
+                marker_name,
+                "JPEG終了マーカー",
+                format!("FF {marker:02X}"),
+            );
+            break;
+        }
+        if marker == 0xDA {
+            push_field(
+                &mut fields,
+                max_fields,
+                marker_offset,
+                2,
+                marker_name,
+                "スキャン開始マーカー",
+                format!("FF {marker:02X}"),
+            );
+        }
+        if jpeg_marker_has_no_length(marker) {
+            push_field(
+                &mut fields,
+                max_fields,
+                marker_offset,
+                2,
+                marker_name,
+                "JPEGマーカー",
+                format!("FF {marker:02X}"),
+            );
+            continue;
+        }
+        let Some(size) = read_u16_be(doc, offset) else {
+            break;
+        };
+        if offset + size as u64 > doc.len() {
+            break;
+        }
+        push_field(
+            &mut fields,
+            max_fields,
+            marker_offset,
+            2,
+            marker_name,
+            "JPEGセグメントマーカー",
+            format!("FF {marker:02X}"),
+        );
+        push_field(
+            &mut fields,
+            max_fields,
+            offset,
+            2,
+            format!("{marker_name} length"),
+            "セグメント長",
+            format!("{} bytes", size),
+        );
+        let data_len = size.saturating_sub(2) as u64;
+        if data_len > 0 {
+            push_field(
+                &mut fields,
+                max_fields,
+                offset + 2,
+                data_len,
+                format!("{marker_name} data"),
+                jpeg_marker_meaning(marker),
+                format!("{} bytes", data_len),
+            );
+        }
+        offset += size as u64;
+        if marker == 0xDA {
+            if let Some(eoi) = find_jpeg_eoi(doc, offset) {
+                push_field(
+                    &mut fields,
+                    max_fields,
+                    offset,
+                    eoi.saturating_sub(offset),
+                    "Entropy-coded data",
+                    "圧縮画像データ",
+                    format!("{} bytes", eoi.saturating_sub(offset)),
+                );
+                push_field(
+                    &mut fields,
+                    max_fields,
+                    eoi,
+                    2,
+                    "EOI",
+                    "JPEG終了マーカー",
+                    "FF D9",
+                );
+            }
+            break;
+        }
+    }
+    FormatSummary {
+        format: "JPEG image".to_string(),
+        fields,
+    }
+}
+
+fn parse_zip_fields(doc: &ByteDocument, max_fields: usize) -> FormatSummary {
+    let mut fields = Vec::new();
+    push_field(
+        &mut fields,
+        max_fields,
+        0,
+        4,
+        "Local file header signature",
+        "ZIPローカルファイルヘッダ識別子",
+        "PK 03 04",
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        4,
+        2,
+        "Version needed",
+        "展開に必要なバージョン",
+        read_u16_le(doc, 4).unwrap_or_default().to_string(),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        6,
+        2,
+        "General purpose flags",
+        "汎用ビットフラグ",
+        format!("0x{:04X}", read_u16_le(doc, 6).unwrap_or_default()),
+    );
+    let method = read_u16_le(doc, 8).unwrap_or_default();
+    push_field(
+        &mut fields,
+        max_fields,
+        8,
+        2,
+        "Compression method",
+        "圧縮方式",
+        format!("{method} ({})", zip_compression(method)),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        10,
+        2,
+        "Modified time",
+        "最終更新時刻(DOS)",
+        format!("0x{:04X}", read_u16_le(doc, 10).unwrap_or_default()),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        12,
+        2,
+        "Modified date",
+        "最終更新日(DOS)",
+        format!("0x{:04X}", read_u16_le(doc, 12).unwrap_or_default()),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        14,
+        4,
+        "CRC-32",
+        "ファイルデータCRC",
+        format!("0x{:08X}", read_u32_le(doc, 14).unwrap_or_default()),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        18,
+        4,
+        "Compressed size",
+        "圧縮後サイズ",
+        format!("{} bytes", read_u32_le(doc, 18).unwrap_or_default()),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        22,
+        4,
+        "Uncompressed size",
+        "展開後サイズ",
+        format!("{} bytes", read_u32_le(doc, 22).unwrap_or_default()),
+    );
+    let name_len = read_u16_le(doc, 26).unwrap_or_default() as u64;
+    let extra_len = read_u16_le(doc, 28).unwrap_or_default() as u64;
+    push_field(
+        &mut fields,
+        max_fields,
+        26,
+        2,
+        "File name length",
+        "ファイル名長",
+        format!("{} bytes", name_len),
+    );
+    push_field(
+        &mut fields,
+        max_fields,
+        28,
+        2,
+        "Extra field length",
+        "拡張フィールド長",
+        format!("{} bytes", extra_len),
+    );
+    if name_len > 0 {
+        push_field(
+            &mut fields,
+            max_fields,
+            30,
+            name_len,
+            "File name",
+            "エントリ名",
+            read_ascii(doc, 30, name_len as usize).unwrap_or_default(),
+        );
+    }
+    if extra_len > 0 {
+        push_field(
+            &mut fields,
+            max_fields,
+            30 + name_len,
+            extra_len,
+            "Extra field",
+            "拡張フィールド",
+            format!("{} bytes", extra_len),
+        );
+    }
+    let data_offset = 30 + name_len + extra_len;
+    let compressed_size = read_u32_le(doc, 18).unwrap_or_default() as u64;
+    if compressed_size > 0 {
+        push_field(
+            &mut fields,
+            max_fields,
+            data_offset,
+            compressed_size,
+            "File data",
+            "圧縮済みファイルデータ",
+            format!("{} bytes", compressed_size),
+        );
+    }
+    FormatSummary {
+        format: "ZIP archive".to_string(),
+        fields,
+    }
+}
+
+fn push_field(
+    fields: &mut Vec<FormatField>,
+    max_fields: usize,
+    offset: u64,
+    len: u64,
+    name: impl Into<String>,
+    meaning: impl Into<String>,
+    value: impl Into<String>,
+) {
+    if fields.len() < max_fields && len > 0 {
+        fields.push(FormatField {
+            offset,
+            len,
+            name: name.into(),
+            meaning: meaning.into(),
+            value: value.into(),
+        });
+    }
+}
+
+fn read_u8(doc: &ByteDocument, offset: u64) -> Option<u8> {
+    doc.read_range(offset, 1).first().copied()
+}
+
+fn read_u16_le(doc: &ByteDocument, offset: u64) -> Option<u16> {
+    let bytes = doc.read_range(offset, 2);
+    Some(u16::from_le_bytes(bytes.as_slice().try_into().ok()?))
+}
+
+fn read_u16_be(doc: &ByteDocument, offset: u64) -> Option<u16> {
+    let bytes = doc.read_range(offset, 2);
+    Some(u16::from_be_bytes(bytes.as_slice().try_into().ok()?))
+}
+
+fn read_u32_le(doc: &ByteDocument, offset: u64) -> Option<u32> {
+    let bytes = doc.read_range(offset, 4);
+    Some(u32::from_le_bytes(bytes.as_slice().try_into().ok()?))
+}
+
+fn read_i32_le(doc: &ByteDocument, offset: u64) -> Option<i32> {
+    let bytes = doc.read_range(offset, 4);
+    Some(i32::from_le_bytes(bytes.as_slice().try_into().ok()?))
+}
+
+fn read_u32_be(doc: &ByteDocument, offset: u64) -> Option<u32> {
+    let bytes = doc.read_range(offset, 4);
+    Some(u32::from_be_bytes(bytes.as_slice().try_into().ok()?))
+}
+
+fn read_ascii(doc: &ByteDocument, offset: u64, len: usize) -> Option<String> {
+    let bytes = doc.read_range(offset, len);
+    if bytes.len() != len {
+        return None;
+    }
+    Some(
+        bytes
+            .iter()
+            .map(|byte| {
+                if (0x20..=0x7e).contains(byte) {
+                    *byte as char
+                } else {
+                    '.'
+                }
+            })
+            .collect(),
+    )
+}
+
+fn png_chunk_meaning(chunk_type: &str) -> String {
+    match chunk_type {
+        "IHDR" => "IHDR: 画像ヘッダ".to_string(),
+        "PLTE" => "PLTE: パレット".to_string(),
+        "IDAT" => "IDAT: 圧縮画像データ".to_string(),
+        "IEND" => "IEND: PNG終端".to_string(),
+        "tEXt" => "tEXt: テキストメタデータ".to_string(),
+        "zTXt" => "zTXt: 圧縮テキストメタデータ".to_string(),
+        "iCCP" => "iCCP: ICCプロファイル".to_string(),
+        "pHYs" => "pHYs: 物理ピクセル寸法".to_string(),
+        "gAMA" => "gAMA: ガンマ値".to_string(),
+        "cHRM" => "cHRM: 色度情報".to_string(),
+        "sRGB" => "sRGB: 標準RGB色空間".to_string(),
+        _ => format!("{chunk_type}: PNG chunk"),
+    }
+}
+
+fn png_color_type(color_type: u8) -> &'static str {
+    match color_type {
+        0 => "grayscale",
+        2 => "truecolor",
+        3 => "indexed color",
+        4 => "grayscale + alpha",
+        6 => "truecolor + alpha",
+        _ => "unknown",
+    }
+}
+
+fn png_interlace(value: u8) -> &'static str {
+    match value {
+        0 => "none",
+        1 => "Adam7",
+        _ => "unknown",
+    }
+}
+
+fn bmp_compression(value: u32) -> &'static str {
+    match value {
+        0 => "BI_RGB",
+        1 => "BI_RLE8",
+        2 => "BI_RLE4",
+        3 => "BI_BITFIELDS",
+        4 => "BI_JPEG",
+        5 => "BI_PNG",
+        6 => "BI_ALPHABITFIELDS",
+        _ => "unknown",
+    }
+}
+
+fn wav_chunk_meaning(chunk_id: &str) -> String {
+    match chunk_id {
+        "fmt " => "fmt: 音声フォーマット".to_string(),
+        "data" => "data: 音声サンプルデータ".to_string(),
+        "LIST" => "LIST: メタデータリスト".to_string(),
+        "fact" => "fact: 圧縮音声情報".to_string(),
+        _ => format!("{chunk_id}: WAV chunk"),
+    }
+}
+
+fn wav_audio_format(value: u16) -> &'static str {
+    match value {
+        1 => "PCM",
+        3 => "IEEE float",
+        6 => "A-law",
+        7 => "mu-law",
+        0xFFFE => "Extensible",
+        _ => "unknown",
+    }
+}
+
+fn jpeg_marker_name(marker: u8) -> &'static str {
+    match marker {
+        0xC0 => "SOF0",
+        0xC2 => "SOF2",
+        0xC4 => "DHT",
+        0xD9 => "EOI",
+        0xDA => "SOS",
+        0xDB => "DQT",
+        0xDD => "DRI",
+        0xE0 => "APP0",
+        0xE1 => "APP1",
+        0xE2 => "APP2",
+        0xE3 => "APP3",
+        0xE4 => "APP4",
+        0xE5 => "APP5",
+        0xE6 => "APP6",
+        0xE7 => "APP7",
+        0xE8 => "APP8",
+        0xE9 => "APP9",
+        0xEA => "APP10",
+        0xEB => "APP11",
+        0xEC => "APP12",
+        0xED => "APP13",
+        0xEE => "APP14",
+        0xEF => "APP15",
+        0xFE => "COM",
+        _ => "Marker",
+    }
+}
+
+fn jpeg_marker_meaning(marker: u8) -> String {
+    match marker {
+        0xC0 => "ベースラインDCTフレーム".to_string(),
+        0xC2 => "プログレッシブDCTフレーム".to_string(),
+        0xC4 => "ハフマンテーブル".to_string(),
+        0xDA => "スキャンヘッダ".to_string(),
+        0xDB => "量子化テーブル".to_string(),
+        0xDD => "リスタート間隔".to_string(),
+        0xE0 => "JFIFなどのAPP0メタデータ".to_string(),
+        0xE1 => "Exif/XMPなどのAPP1メタデータ".to_string(),
+        0xFE => "コメント".to_string(),
+        0xE2..=0xEF => "アプリケーション固有メタデータ".to_string(),
+        _ => "JPEG segment data".to_string(),
+    }
+}
+
+fn jpeg_marker_has_no_length(marker: u8) -> bool {
+    marker == 0x01 || (0xD0..=0xD7).contains(&marker)
+}
+
+fn find_jpeg_eoi(doc: &ByteDocument, start: u64) -> Option<u64> {
+    let mut offset = start;
+    while offset + 1 < doc.len() {
+        let bytes = doc.read_range(offset, 64 * 1024);
+        if bytes.len() < 2 {
+            return None;
+        }
+        if let Some(pos) = bytes.windows(2).position(|window| window == b"\xFF\xD9") {
+            return Some(offset + pos as u64);
+        }
+        offset += bytes.len() as u64 - 1;
+    }
+    None
+}
+
+fn zip_compression(value: u16) -> &'static str {
+    match value {
+        0 => "stored",
+        8 => "deflate",
+        12 => "bzip2",
+        14 => "lzma",
+        93 => "zstd",
+        98 => "ppmd",
+        _ => "unknown",
+    }
 }
 
 pub fn parse_hex_bytes(input: &str) -> Result<Vec<u8>> {
@@ -729,6 +1815,155 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(3),
             "linear search took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn detects_png_chunks_and_ihdr_fields() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x89PNG\r\n\x1A\n");
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&320u32.to_be_bytes());
+        bytes.extend_from_slice(&200u32.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&0x12345678u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"IEND");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        let doc = ByteDocument::from_bytes("image.png", bytes);
+
+        let summary = detect_format_fields(&doc, 64).expect("png summary");
+        assert_eq!(summary.format, "PNG image");
+        assert!(summary.fields.iter().any(|field| {
+            field.name == "IHDR width" && field.meaning == "画像幅" && field.value == "320"
+        }));
+        assert!(
+            summary
+                .fields
+                .iter()
+                .any(|field| field.name == "IHDR color type" && field.value.contains("alpha"))
+        );
+    }
+
+    #[test]
+    fn detects_bmp_header_fields() {
+        let mut bytes = vec![0u8; 54];
+        bytes[0..2].copy_from_slice(b"BM");
+        bytes[2..6].copy_from_slice(&54u32.to_le_bytes());
+        bytes[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bytes[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bytes[18..22].copy_from_slice(&2i32.to_le_bytes());
+        bytes[22..26].copy_from_slice(&3i32.to_le_bytes());
+        bytes[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..30].copy_from_slice(&24u16.to_le_bytes());
+        let doc = ByteDocument::from_bytes("image.bmp", bytes);
+
+        let summary = detect_format_fields(&doc, 64).expect("bmp summary");
+        assert_eq!(summary.format, "BMP image");
+        assert!(
+            summary
+                .fields
+                .iter()
+                .any(|field| field.name == "Width" && field.value == "2")
+        );
+        assert!(summary.fields.iter().any(|field| {
+            field.name == "Bits per pixel" && field.meaning == "1ピクセルあたりのビット数"
+        }));
+    }
+
+    #[test]
+    fn detects_wav_fmt_and_data_chunks() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&36u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&44100u32.to_le_bytes());
+        bytes.extend_from_slice(&176400u32.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        let doc = ByteDocument::from_bytes("sound.wav", bytes);
+
+        let summary = detect_format_fields(&doc, 64).expect("wav summary");
+        assert_eq!(summary.format, "WAV audio");
+        assert!(
+            summary
+                .fields
+                .iter()
+                .any(|field| { field.name == "Sample rate" && field.value == "44100 Hz" })
+        );
+        assert!(
+            summary
+                .fields
+                .iter()
+                .any(|field| field.name == "Audio data" && field.meaning.contains("音声データ"))
+        );
+    }
+
+    #[test]
+    fn detects_common_gif_jpeg_and_zip_headers() {
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&16u16.to_le_bytes());
+        gif.extend_from_slice(&8u16.to_le_bytes());
+        gif.extend_from_slice(&[0b1000_0001, 0, 0]);
+        let gif = ByteDocument::from_bytes("image.gif", gif);
+        assert_eq!(
+            detect_format_fields(&gif, 16).expect("gif summary").format,
+            "GIF image"
+        );
+
+        let jpeg = ByteDocument::from_bytes(
+            "image.jpg",
+            vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, b'J', b'F', 0xFF, 0xD9],
+        );
+        let jpeg_summary = detect_format_fields(&jpeg, 16).expect("jpeg summary");
+        assert_eq!(jpeg_summary.format, "JPEG image");
+        assert!(jpeg_summary.fields.iter().any(|field| field.name == "APP0"));
+
+        let mut zip = b"PK\x03\x04".to_vec();
+        zip.extend_from_slice(&20u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(&0u32.to_le_bytes());
+        zip.extend_from_slice(&4u32.to_le_bytes());
+        zip.extend_from_slice(&4u32.to_le_bytes());
+        zip.extend_from_slice(&8u16.to_le_bytes());
+        zip.extend_from_slice(&0u16.to_le_bytes());
+        zip.extend_from_slice(b"file.txt");
+        zip.extend_from_slice(&[1, 2, 3, 4]);
+        let zip = ByteDocument::from_bytes("archive.zip", zip);
+        let zip_summary = detect_format_fields(&zip, 32).expect("zip summary");
+        assert_eq!(zip_summary.format, "ZIP archive");
+        assert!(
+            zip_summary
+                .fields
+                .iter()
+                .any(|field| field.name == "File name" && field.value == "file.txt")
+        );
+    }
+
+    #[test]
+    fn format_detection_uses_latest_edited_bytes() {
+        let mut doc = ByteDocument::from_bytes("edited.bin", b"??\0\0\0\0".to_vec());
+        assert!(detect_format_fields(&doc, 16).is_none());
+
+        doc.overwrite(0, b"BM".to_vec()).unwrap();
+        let summary = detect_format_fields(&doc, 16).expect("edited bmp summary");
+        assert_eq!(summary.format, "BMP image");
+        assert!(
+            summary
+                .fields
+                .iter()
+                .any(|field| field.name == "Signature" && field.value == "BM")
         );
     }
 }
