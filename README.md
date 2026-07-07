@@ -11,6 +11,7 @@ ByteForge is a modern desktop binary editor prototype written in Rust with [GPUI
 - Left/right split view with independent file tabs, active tab state, file assignment, and pane focus.
 - Virtualized hex view using GPUI `uniform_list`; only visible rows are rendered.
 - GPUI Component-backed hex viewport scrollbar.
+- Monospaced, non-wrapping hex rows and address columns.
 - Memory-mapped original file content through `memmap2`.
 - Piece-table editing model for insert, overwrite, replacement, and arbitrary range deletion.
 - Insert and overwrite modes.

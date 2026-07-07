@@ -24,6 +24,9 @@ use gpui_component::{
 };
 
 const BYTES_PER_ROW_OPTIONS: [usize; 4] = [8, 16, 24, 32];
+const HEX_FONT_FAMILY: &str =
+    "Consolas, 'Cascadia Mono', 'Courier New', ui-monospace, SFMono-Regular, monospace";
+const ADDRESS_COL_WIDTH: f32 = 152.0;
 
 actions!(
     byteforge,
@@ -1562,10 +1565,13 @@ impl ByteForge {
             .border_b_1()
             .border_color(rgb(0x252c35))
             .text_xs()
-            .font_family("Consolas, ui-monospace, SFMono-Regular, monospace")
+            .font_family(HEX_FONT_FAMILY)
+            .whitespace_nowrap()
             .child(
                 div()
-                    .w(px(132.0))
+                    .w(px(ADDRESS_COL_WIDTH))
+                    .flex_shrink_0()
+                    .whitespace_nowrap()
                     .text_color(rgb(0x768497))
                     .child("Address"),
             )
@@ -1631,6 +1637,12 @@ impl ByteForge {
         let address_active = anchor_row_start == Some(offset);
 
         div()
+            .debug_selector(move || {
+                format!(
+                    "hex-row-{}-{offset:016X}",
+                    side.label().to_ascii_lowercase()
+                )
+            })
             .flex()
             .flex_shrink_0()
             .w_full()
@@ -1638,13 +1650,23 @@ impl ByteForge {
             .h(px(28.0))
             .px_2()
             .text_sm()
-            .font_family("Consolas, ui-monospace, SFMono-Regular, monospace")
+            .font_family(HEX_FONT_FAMILY)
+            .whitespace_nowrap()
             .text_color(rgb(0xdbe4ef))
             .child(
                 div()
-                    .w(px(132.0))
+                    .debug_selector(move || {
+                        format!(
+                            "hex-address-{}-{offset:016X}",
+                            side.label().to_ascii_lowercase()
+                        )
+                    })
+                    .w(px(ADDRESS_COL_WIDTH))
+                    .flex_shrink_0()
                     .rounded_sm()
                     .px_1()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
                     .bg(if address_active {
                         rgb(0xd7a94a)
                     } else {
@@ -1657,8 +1679,8 @@ impl ByteForge {
                     })
                     .child(format!("{offset:016X}")),
             )
-            .child(div().flex().gap_1().children(byte_cells))
-            .child(div().ml_4().flex().children(ascii_cells))
+            .child(div().flex().flex_shrink_0().gap_1().children(byte_cells))
+            .child(div().ml_4().flex().flex_shrink_0().children(ascii_cells))
             .into_any_element()
     }
 
@@ -1683,6 +1705,7 @@ impl ByteForge {
         let mut cell = div()
             .id(("byte", byte_cell_id(side, offset, 0)))
             .w(px(28.0))
+            .flex_shrink_0()
             .h(px(22.0))
             .flex()
             .items_center()
@@ -1690,6 +1713,7 @@ impl ByteForge {
             .rounded_sm()
             .border_1()
             .border_color(rgba(0x00000000))
+            .whitespace_nowrap()
             .cursor_pointer()
             .child(label);
 
@@ -1755,12 +1779,14 @@ impl ByteForge {
         let mut cell = div()
             .id(("byte", byte_cell_id(side, offset, 1)))
             .w(px(14.0))
+            .flex_shrink_0()
             .h(px(22.0))
             .flex()
             .items_center()
             .justify_center()
             .border_1()
             .border_color(rgba(0x00000000))
+            .whitespace_nowrap()
             .cursor_pointer()
             .child(ch.to_string());
         if clickable {
@@ -2433,6 +2459,45 @@ mod tests {
                 "large document should produce scrollable list content"
             );
         });
+    }
+
+    #[gpui::test]
+    fn wide_address_digits_do_not_wrap_hex_rows(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let bytes = (0..0xD000).map(|ix| (ix % 251) as u8).collect();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            ByteForge::with_documents(
+                vec![ByteDocument::from_bytes("wide-address.bin", bytes)],
+                cx,
+            )
+        });
+        let row = 0xCCC0 / BYTES_PER_ROW_OPTIONS[1];
+
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
+        view.update(cx, |view, _| {
+            view.left_scroll_handle
+                .scroll_to_item(row, ScrollStrategy::Top);
+        });
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
+        draw_visual_app_at(cx, &view, 1280.0, 820.0);
+
+        let row_bounds = cx
+            .debug_bounds("hex-row-left-000000000000CCC0")
+            .expect("target row should be visible");
+        let address_bounds = cx
+            .debug_bounds("hex-address-left-000000000000CCC0")
+            .expect("target address should be visible");
+        assert!(
+            address_bounds.size.width >= px(ADDRESS_COL_WIDTH - 1.0),
+            "address column is too narrow: {:?}",
+            address_bounds
+        );
+        assert!(
+            address_bounds.origin.y >= row_bounds.origin.y
+                && address_bounds.origin.y + address_bounds.size.height
+                    <= row_bounds.origin.y + row_bounds.size.height,
+            "address wrapped outside row bounds: row={row_bounds:?} address={address_bounds:?}"
+        );
     }
 
     #[gpui::test]
