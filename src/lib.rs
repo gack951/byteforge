@@ -1064,6 +1064,18 @@ impl ByteForge {
             return;
         };
         let key = event.keystroke.key.as_str();
+        if key == "enter" {
+            if field == TextField::Goto {
+                self.confirm_goto_from_input(cx);
+            } else if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+                self.replace_all(&ReplaceAll, window, cx);
+            } else {
+                self.replace_next(&ReplaceNext, window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
             match key {
                 "a" => {
@@ -1084,14 +1096,6 @@ impl ByteForge {
         }
 
         match key {
-            "enter" => {
-                if field == TextField::Goto {
-                    self.confirm_goto_from_input(cx);
-                } else {
-                    self.replace_next(&ReplaceNext, window, cx);
-                }
-                cx.stop_propagation();
-            }
             "escape" => {
                 if field == TextField::Goto {
                     self.goto_open = false;
@@ -1313,22 +1317,6 @@ impl ByteForge {
                         Some("Ctrl+H"),
                         cx.listener(|this, _, window, cx| {
                             this.toggle_replace(&ToggleReplace, window, cx)
-                        }),
-                    ))
-                    .child(self.toolbar_button(
-                        "replace-next",
-                        "Replace 1",
-                        None,
-                        cx.listener(|this, _, window, cx| {
-                            this.replace_next(&ReplaceNext, window, cx)
-                        }),
-                    ))
-                    .child(self.toolbar_button(
-                        "replace-all",
-                        "Replace All",
-                        None,
-                        cx.listener(|this, _, window, cx| {
-                            this.replace_all(&ReplaceAll, window, cx)
                         }),
                     ))
                     .child(self.toolbar_button(
@@ -2111,14 +2099,14 @@ impl ByteForge {
                 ))
                 .child(self.toolbar_button(
                     "replace-panel-next",
-                    "Replace 1",
-                    None,
+                    "Replace",
+                    Some("Enter"),
                     cx.listener(|this, _, window, cx| this.replace_next(&ReplaceNext, window, cx)),
                 ))
                 .child(self.toolbar_button(
                     "replace-panel-all",
                     "Replace All",
-                    None,
+                    Some("Ctrl+Enter"),
                     cx.listener(|this, _, window, cx| this.replace_all(&ReplaceAll, window, cx)),
                 ))
                 .into_any_element()
@@ -2532,6 +2520,26 @@ mod tests {
             "tab-left-0",
             "tab-right-1",
             "format-field-0",
+        ] {
+            assert_visible(cx, selector, width, height);
+        }
+        assert!(
+            cx.debug_bounds("button-replace-next").is_none(),
+            "top toolbar replace-next button should not be rendered"
+        );
+        assert!(
+            cx.debug_bounds("button-replace-all").is_none(),
+            "top toolbar replace-all button should not be rendered"
+        );
+
+        click_button(cx, "button-replace");
+        draw_visual_app_at(cx, &view, width, height);
+        for selector in [
+            "replace-panel",
+            "replace-find-input",
+            "replace-with-input",
+            "button-replace-panel-next",
+            "button-replace-panel-all",
         ] {
             assert_visible(cx, selector, width, height);
         }
@@ -3293,6 +3301,7 @@ mod tests {
 
     #[gpui::test]
     fn replace_next_and_replace_all_update_document(cx: &mut TestAppContext) {
+        cx.update(bind_test_keys);
         let window = open_test_window(
             cx,
             vec![ByteDocument::from_bytes(
@@ -3315,6 +3324,27 @@ mod tests {
                 view.replace_all(&ReplaceAll, window, cx);
                 assert_eq!(doc_bytes(view), b"XY XY XY");
                 assert_eq!(view.status.as_ref(), "2 件を置換しました。");
+            })
+            .unwrap();
+
+        window
+            .update(cx, |view, _, cx| {
+                view.docs[0] = ByteDocument::from_bytes("sample.bin", b"abc abc abc".to_vec());
+                view.active = 0;
+                view.focused_pane = PaneSide::Left;
+                view.replace_open = true;
+                view.active_text_field = Some(TextField::Find);
+                view.find_input = "abc".to_string();
+                view.replace_input = "Z".to_string();
+                view.text_selection = None;
+                view.set_cursor(0, false, cx);
+            })
+            .unwrap();
+        cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-enter").unwrap());
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(doc_bytes(view), b"Z Z Z");
+                assert_eq!(view.status.as_ref(), "3 件を置換しました。");
             })
             .unwrap();
     }

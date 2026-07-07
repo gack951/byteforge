@@ -77,6 +77,8 @@ target\release\byteforge.exe path\to\file.bin
 | `Delete` / `Backspace` | Delete selection |
 | `Ctrl+F` | Find clipboard bytes |
 | `Ctrl+H` | Open replacement panel |
+| `Enter` | Replace next match while the replacement panel is focused |
+| `Ctrl+Enter` | Replace all matches while the replacement panel is focused |
 | `Ctrl+G` | Goto offset |
 | `Ctrl+D` | Compare with next open file |
 | `Ctrl+\` | Toggle split view |
